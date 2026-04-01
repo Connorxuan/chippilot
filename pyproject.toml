@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "openroad-agent"
+version = "0.1.0"
+description = "LLM-powered EDA automation for OpenROAD using DeepAgents framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "deepagents>=0.1.0",
+    "langchain-core>=0.3.0",
+    "langchain-google-genai>=2.0.0",
+    "langgraph>=0.4.0",
+    "langgraph-checkpoint>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+openroad-agent = "openroad_agent.main:main"
+
+[tool.setuptools.packages.find]
+include = ["openroad_agent*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100

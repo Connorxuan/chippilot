@@ -1,0 +1,10 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -c \"\nfrom deepagents\\.middleware\\.subagents import SubAgent, CompiledSubAgent\nprint\\(type\\(SubAgent\\)\\)\nprint\\(dir\\(SubAgent\\)\\)\nprint\\(\\)\nprint\\(type\\(CompiledSubAgent\\)\\)\nprint\\(dir\\(CompiledSubAgent\\)\\)\n# Try to see if SubAgent is a TypedDict\nimport typing\nprint\\(\\)\ntry:\n    print\\('SubAgent annotations:', SubAgent\\.__annotations__\\)\nexcept:\n    print\\('No annotations'\\)\ntry:\n    print\\('CompiledSubAgent annotations:', CompiledSubAgent\\.__annotations__\\)\nexcept:\n    print\\('No annotations'\\)\n\" 2>&1$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    },
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
+}
