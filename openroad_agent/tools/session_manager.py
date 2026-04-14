@@ -90,6 +90,11 @@ class SessionManager:
         """Directory for user-uploaded design files."""
         return self._designs_dir
 
+    @property
+    def chat_log_path(self) -> str:
+        """Path to the session chat log."""
+        return self._chat_log_path
+
     def run_dir(self, run_label: str) -> str:
         """Return (and create) a run directory inside the session.
 
@@ -240,6 +245,33 @@ class SessionManager:
         """Create a new session and set it as the active singleton."""
         cls._current = cls(work_dir, name_hint)
         return cls._current
+
+    @classmethod
+    def load_existing(cls, work_dir: str, session_name: str) -> "SessionManager":
+        """Load an existing session directory and set it as active."""
+        base_dir = os.path.join(work_dir, "sessions", session_name)
+        if not os.path.isdir(base_dir):
+            raise FileNotFoundError(f"Session not found: {session_name}")
+
+        meta_path = os.path.join(base_dir, "session.json")
+        meta: dict[str, Any] = {}
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+        session = cls.__new__(cls)
+        session.timestamp = meta.get("created", session_name.split("_", 1)[0])
+        session.name_hint = meta.get("name_hint", "")
+        session.session_name = meta.get("session_name", session_name)
+        session.work_dir = work_dir
+        session.base_dir = base_dir
+        session._designs_dir = os.path.join(base_dir, "designs")
+        os.makedirs(session._designs_dir, exist_ok=True)
+        session._runs = meta.get("runs", [])
+        session._chat_log_path = os.path.join(base_dir, "chat_log.jsonl")
+
+        cls._current = session
+        return session
 
     @classmethod
     def get_current(cls) -> "SessionManager | None":

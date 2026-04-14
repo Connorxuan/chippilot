@@ -2,3 +2,6 @@
 /OpenROAD/
 /openroad_work/
 /paper/
+/openroad_agent.egg-info/
+/__pycache__/
+*.log

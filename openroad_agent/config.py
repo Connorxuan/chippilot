@@ -44,7 +44,7 @@ class OpenROADConfig:
     # "ray"   = submit to remote Ray cluster
     execution_mode: str = os.environ.get("OPENROAD_EXEC_MODE", "ray")
     ray_address: str = os.environ.get(
-        "RAY_ADDRESS", "ray://10.0.1.16:10001"
+        "RAY_ADDRESS", "ray://10.0.4.85:10001"
     )
 
     # ── Exploration defaults ───────────────────────────────────────────
