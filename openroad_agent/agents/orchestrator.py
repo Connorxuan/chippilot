@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 from typing import Any
 
@@ -240,9 +241,11 @@ def _run_coro_blocking(coro):
     result: dict[str, Any] = {}
     error: dict[str, BaseException] = {}
 
+    ctx = contextvars.copy_context()
+
     def _runner() -> None:
         try:
-            result["value"] = asyncio.run(coro)
+            result["value"] = ctx.run(asyncio.run, coro)
         except BaseException as exc:  # pragma: no cover
             error["value"] = exc
 

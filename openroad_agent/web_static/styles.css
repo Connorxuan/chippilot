@@ -61,6 +61,7 @@ body {
 }
 
 button,
+input,
 textarea {
   font: inherit;
 }
@@ -120,41 +121,36 @@ button {
 }
 
 .brand-mark {
-  position: relative;
   width: 56px;
   height: 56px;
-  border-radius: 18px;
-  background:
-    linear-gradient(145deg, rgba(216, 185, 139, 0.95), rgba(245, 237, 220, 0.72));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  box-shadow:
+    0 12px 24px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
 }
 
-.brand-mark span {
-  position: absolute;
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(16, 42, 38, 0.64);
-  border-radius: 5px;
+.chip-logo {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.brand-mark span:nth-child(1) {
-  top: 9px;
-  left: 9px;
+.chip-logo-bg {
+  fill: var(--accent);
 }
 
-.brand-mark span:nth-child(2) {
-  top: 9px;
-  right: 9px;
+.chip-logo-pins,
+.chip-logo-core {
+  fill: #f8f6f1;
 }
 
-.brand-mark span:nth-child(3) {
-  bottom: 9px;
-  left: 9px;
+.chip-logo-die {
+  fill: var(--accent-strong);
 }
 
-.brand-mark span:nth-child(4) {
-  bottom: 9px;
-  right: 9px;
+.avatar-assistant .chip-logo {
+  width: 34px;
+  height: 34px;
 }
 
 .brand-kicker,
@@ -345,7 +341,7 @@ button {
 
 .topbar {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 16px;
   padding: 22px 28px;
@@ -396,19 +392,135 @@ button {
   font-size: 0.82rem;
 }
 
-.download-results-button {
+.download-results-button,
+.export-chat-button {
   padding: 10px 14px;
   border-radius: 8px;
+  white-space: nowrap;
+}
+
+.download-results-button {
   background: var(--accent);
   color: white;
-  white-space: nowrap;
   box-shadow: 0 10px 24px rgba(15, 118, 110, 0.22);
 }
 
-.download-results-button:disabled {
+.export-chat-button {
+  background: rgba(255, 255, 255, 0.66);
+  border: 1px solid var(--line);
+  color: var(--accent-strong);
+}
+
+.download-results-button:disabled,
+.export-chat-button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
   box-shadow: none;
+}
+
+.user-menu {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  white-space: nowrap;
+}
+
+.user-menu button {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.66);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.auth-shell {
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(15, 118, 110, 0.14), transparent 24%),
+    linear-gradient(145deg, #f7f2e8 0%, #ece4d8 48%, #efe8dd 100%);
+}
+
+.auth-panel {
+  width: min(100%, 440px);
+  padding: 28px;
+  border-radius: 8px;
+  background: rgba(255, 252, 245, 0.92);
+  border: 1px solid rgba(48, 39, 27, 0.12);
+  box-shadow: var(--shadow);
+}
+
+.auth-loading {
+  color: var(--muted);
+  text-align: center;
+}
+
+.auth-brand {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 26px;
+}
+
+.auth-brand h1 {
+  margin: 0;
+  font-size: 1.45rem;
+}
+
+.auth-field {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.auth-field input {
+  width: 100%;
+  padding: 12px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  outline: none;
+}
+
+.auth-field input:focus {
+  border-color: rgba(15, 118, 110, 0.42);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+}
+
+.auth-error {
+  margin: 0 0 16px;
+}
+
+.auth-submit,
+.auth-switch {
+  width: 100%;
+  border-radius: 8px;
+}
+
+.auth-submit {
+  padding: 13px 16px;
+  background: var(--accent);
+  color: white;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.auth-switch {
+  margin-top: 10px;
+  padding: 11px 16px;
+  background: transparent;
+  color: var(--accent-strong);
 }
 
 .menu-button {
@@ -445,6 +557,11 @@ button {
   align-items: start;
 }
 
+.message-row-activity {
+  grid-template-columns: minmax(0, 1fr);
+  padding-left: 62px;
+}
+
 .avatar {
   display: grid;
   place-items: center;
@@ -461,7 +578,7 @@ button {
 }
 
 .avatar-assistant {
-  background: linear-gradient(145deg, var(--accent), #4d9488);
+  background: transparent;
   color: white;
 }
 
@@ -573,6 +690,27 @@ button {
 .activity-details-body {
   padding: 0 18px 18px;
   border-top: 1px solid rgba(48, 39, 27, 0.08);
+}
+
+.activity-merged-body {
+  display: grid;
+  gap: 12px;
+}
+
+.activity-block {
+  display: grid;
+  gap: 8px;
+}
+
+.activity-block > span {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.activity-block-result {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
 }
 
 .message-head strong {
@@ -905,7 +1043,9 @@ button {
   }
 
   .topbar-meta,
-  .download-results-button {
+  .download-results-button,
+  .export-chat-button,
+  .user-menu {
     grid-column: 1 / -1;
   }
 
@@ -923,6 +1063,10 @@ button {
 
   .message-row {
     grid-template-columns: 1fr;
+  }
+
+  .message-row-activity {
+    padding-left: 0;
   }
 
   .avatar {

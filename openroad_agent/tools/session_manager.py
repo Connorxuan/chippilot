@@ -36,7 +36,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -48,6 +49,23 @@ from openroad_agent.tools.artifacts import list_session_artifacts
 
 
 _NON_RUN_DIRS = {"designs", "attachments", "__pycache__"}
+_SESSION_TZ = timezone(timedelta(hours=8))
+_current_session: ContextVar["SessionManager | None"] = ContextVar(
+    "openroad_agent_current_session",
+    default=None,
+)
+
+
+def _now() -> datetime:
+    return datetime.now(_SESSION_TZ)
+
+
+def _session_timestamp() -> str:
+    return _now().strftime("%Y%m%d_%H%M%S")
+
+
+def _iso_timestamp() -> str:
+    return _now().isoformat()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -57,11 +75,11 @@ _NON_RUN_DIRS = {"designs", "attachments", "__pycache__"}
 class SessionManager:
     """Manages the working directory for a single conversation session."""
 
-    # Module-level singleton
+    # Backward-compatible fallback for CLI flows outside an async request context.
     _current: "SessionManager | None" = None
 
     def __init__(self, work_dir: str, name_hint: str = "") -> None:
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.timestamp = _session_timestamp()
         self.name_hint = name_hint
 
         # Build session directory name
@@ -124,7 +142,7 @@ class SessionManager:
         entry: dict[str, Any] = {
             "run_label": run_label,
             "tool": tool,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _iso_timestamp(),
         }
         if success is not None:
             entry["success"] = success
@@ -145,7 +163,8 @@ class SessionManager:
             **extra: Additional fields (e.g. ``tool_name``, ``agent_name``).
         """
         entry: dict[str, Any] = {
-            "ts": datetime.now().isoformat(),
+            "ts": _iso_timestamp(),
+            "tz": "UTC+08:00",
             "role": role,
             "content": content,
         }
@@ -161,7 +180,8 @@ class SessionManager:
     ) -> None:
         """Append a tool-call entry to the chat log."""
         entry: dict[str, Any] = {
-            "ts": datetime.now().isoformat(),
+            "ts": _iso_timestamp(),
+            "tz": "UTC+08:00",
             "role": "tool_call",
             "tool_name": tool_name,
         }
@@ -202,19 +222,12 @@ class SessionManager:
                     rel = os.path.relpath(os.path.join(root, fn), self._designs_dir)
                     design_files.append(rel)
 
-        # List run directories
-        run_dirs: list[str] = []
-        for entry in sorted(os.listdir(self.base_dir)):
-            ep = os.path.join(self.base_dir, entry)
-            if os.path.isdir(ep) and entry != "designs":
-                run_dirs.append(entry)
-
         return {
             "session_name": self.session_name,
             "base_dir": self.base_dir,
             "designs_dir": self._designs_dir,
             "design_files": design_files,
-            "run_dirs": run_dirs,
+            "run_dirs": list_run_dirs(self.base_dir),
             "runs": self._runs,
         }
 
@@ -247,8 +260,9 @@ class SessionManager:
 
     @classmethod
     def start_new(cls, work_dir: str, name_hint: str = "") -> "SessionManager":
-        """Create a new session and set it as the active singleton."""
+        """Create a new session and set it as active for the current context."""
         cls._current = cls(work_dir, name_hint)
+        _current_session.set(cls._current)
         return cls._current
 
     @classmethod
@@ -276,17 +290,19 @@ class SessionManager:
         session._chat_log_path = os.path.join(base_dir, "chat_log.jsonl")
 
         cls._current = session
+        _current_session.set(session)
         return session
 
     @classmethod
     def get_current(cls) -> "SessionManager | None":
         """Return the active session, or None if not started."""
-        return cls._current
+        return _current_session.get() or cls._current
 
     @classmethod
     def clear(cls) -> None:
         """Clear the active session (for testing)."""
         cls._current = None
+        _current_session.set(None)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -387,13 +403,13 @@ def start_session(session_name: str = "") -> str:
     Returns:
         JSON with session info (base_dir, designs_dir, etc.).
     """
-    cfg = _get_cfg()
     session = SessionManager.get_current()
     if session:
         # Rename existing session
         if session_name and session_name != session.name_hint:
             session.rename(session_name)
     else:
+        cfg = _get_cfg()
         session = SessionManager.start_new(cfg.work_dir, session_name)
     return json.dumps(session.to_dict())
 
@@ -457,8 +473,9 @@ def list_sessions() -> str:
     Returns:
         JSON array of session summaries with name, date, and directory.
     """
-    cfg = _get_cfg()
-    sessions_root = os.path.join(cfg.work_dir, "sessions")
+    session = SessionManager.get_current()
+    work_dir = session.work_dir if session else _get_cfg().work_dir
+    sessions_root = os.path.join(work_dir, "sessions")
     if not os.path.isdir(sessions_root):
         return json.dumps([])
 
