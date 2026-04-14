@@ -7,7 +7,7 @@ import threading
 from typing import Any
 
 from langchain.chat_models.base import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 from langchain.agents import create_agent
@@ -65,6 +65,7 @@ from openroad_agent.tools.session_manager import (
     SessionManager,
     start_session,
     get_session_info,
+    list_downloadable_artifacts,
     list_sessions,
 )
 
@@ -103,6 +104,7 @@ def _all_tools():
         # ── Session management ──
         start_session,
         get_session_info,
+        list_downloadable_artifacts,
         list_sessions,
     ]
 
@@ -196,6 +198,23 @@ def _extract_subagent_result(result: dict) -> str:
     return "Sub-agent produced no output."
 
 
+def _has_subagent_output(result: dict) -> bool:
+    """Return True if a sub-agent result contains AI text or tool output."""
+    for msg in result.get("messages", []):
+        msg_type = getattr(msg, "type", "")
+        if msg_type == "tool":
+            raw = _normalise_content(msg.content)
+            if raw.strip():
+                return True
+        if msg_type == "ai":
+            text = _normalise_content(msg.content)
+            if text.strip():
+                return True
+            if getattr(msg, "tool_calls", None):
+                return True
+    return False
+
+
 # ── Sub-agent streaming callback ──────────────────────────────────────
 #
 # When set, sub-agents stream their internal messages (tool calls,
@@ -279,36 +298,49 @@ def _make_subagent_tool(
         Returns:
             The sub-agent's final text response.
         """
+        cb = _stream_callback
+        if cb:
+            cb("start", name, None)
+
         try:
             llm = init_chat_model(model_name)
             sub = create_agent(
                 model=llm,
                 tools=agent_tools,
-                prompt=system_prompt,
+                system_prompt=system_prompt,
             )
 
-            cb = _stream_callback
             if cb:
                 # ── Streaming mode: forward sub-agent events ──────
                 async def _run_streaming():
-                    cb("start", name, None)
-                    try:
-                        all_msgs = [HumanMessage(content=task)]
-                        async for event in sub.astream(
-                            {"messages": [HumanMessage(content=task)]},
-                            config={"recursion_limit": 120},
-                            stream_mode="updates",
-                        ):
-                            for _nd, nd_out in event.items():
-                                if "messages" in nd_out:
-                                    for m in nd_out["messages"]:
-                                        all_msgs.append(m)
-                                        cb("msg", name, m)
-                    finally:
-                        cb("end", name, None)
+                    all_msgs = [HumanMessage(content=task)]
+                    async for event in sub.astream(
+                        {"messages": [HumanMessage(content=task)]},
+                        config={"recursion_limit": 120},
+                        stream_mode="updates",
+                    ):
+                        for _nd, nd_out in event.items():
+                            if "messages" in nd_out:
+                                for m in nd_out["messages"]:
+                                    all_msgs.append(m)
+                                    cb("msg", name, m)
                     return {"messages": all_msgs}
 
                 result = _run_coro_blocking(_run_streaming())
+                if not _has_subagent_output(result):
+                    retry_notice = AIMessage(
+                        content=(
+                            "Sub-agent streaming produced no actions or final response; "
+                            "retrying once without streaming."
+                        )
+                    )
+                    cb("msg", name, retry_notice)
+                    result = _run_coro_blocking(
+                        sub.ainvoke(
+                            {"messages": [HumanMessage(content=task)]},
+                            config={"recursion_limit": 120},
+                        )
+                    )
             else:
                 # ── Silent mode (non-interactive / tests) ─────────
                 result = _run_coro_blocking(
@@ -319,9 +351,18 @@ def _make_subagent_tool(
                 )
             return _extract_subagent_result(result)
         except Exception as exc:
+            if cb:
+                cb(
+                    "msg",
+                    name,
+                    AIMessage(content=f"Sub-agent encountered an error: {type(exc).__name__}: {exc}"),
+                )
             return (
                 f"Sub-agent encountered an error: {type(exc).__name__}: {exc}"
             )
+        finally:
+            if cb:
+                cb("end", name, None)
 
     return _delegate
 

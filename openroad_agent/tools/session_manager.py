@@ -39,10 +39,15 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from langchain_core.tools import tool
 
 from openroad_agent.config import OpenROADConfig
+from openroad_agent.tools.artifacts import list_session_artifacts
+
+
+_NON_RUN_DIRS = {"designs", "attachments", "__pycache__"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -308,6 +313,48 @@ def get_session_name() -> str | None:
     return session.session_name if session else None
 
 
+def list_run_dirs(base_dir: str | Path) -> list[str]:
+    """List top-level directories in a session that look like tool runs."""
+    root = Path(base_dir)
+    if not root.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in root.iterdir()
+        if path.is_dir()
+        and path.name not in _NON_RUN_DIRS
+        and not path.name.startswith(".")
+    )
+
+
+def run_count_from_meta(meta: dict[str, Any], base_dir: str | Path) -> int:
+    """Return a run count that works for both new and legacy sessions."""
+    recorded_runs = meta.get("runs", [])
+    if recorded_runs:
+        return len(recorded_runs)
+    return len(list_run_dirs(base_dir))
+
+
+def register_current_run(
+    run_label: str,
+    tool_name: str,
+    result: dict[str, Any],
+) -> None:
+    """Record a completed tool run in the active session metadata."""
+    session = SessionManager.get_current()
+    if not session:
+        return
+
+    success = result.get("success")
+    metrics = result.get("metrics")
+    session.register_run(
+        run_label=run_label,
+        tool=tool_name,
+        success=success if isinstance(success, bool) else None,
+        metrics=metrics if isinstance(metrics, dict) else None,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # LangChain tools — let the LLM manage sessions
 # ═══════════════════════════════════════════════════════════════════════
@@ -368,6 +415,42 @@ def get_session_info() -> str:
 
 
 @tool
+def list_downloadable_artifacts(include_inputs: bool = False) -> str:
+    """List files from the current session that can be downloaded by the user.
+
+    Use this when the user asks to download generated results, GDS files,
+    reports, logs, or an archive of the current session outputs. The returned
+    JSON includes browser-relative URLs that can be shown directly to the user.
+
+    Args:
+        include_inputs: Include user input files from designs/ and attachments/.
+
+    Returns:
+        JSON with downloadable artifacts and an all-results zip URL.
+    """
+    session = SessionManager.get_current()
+    if not session:
+        return json.dumps({"error": "No active session. Use start_session first."})
+
+    artifacts = list_session_artifacts(Path(session.base_dir), include_inputs=include_inputs)
+    for artifact in artifacts:
+        artifact["download_url"] = (
+            f"/api/sessions/{quote(session.session_name)}/download?"
+            f"file_path={quote(artifact['path'])}"
+        )
+
+    return json.dumps(
+        {
+            "session_name": session.session_name,
+            "artifact_count": len(artifacts),
+            "zip_download_url": f"/api/sessions/{quote(session.session_name)}/download.zip",
+            "artifacts": artifacts,
+        },
+        indent=2,
+    )
+
+
+@tool
 def list_sessions() -> str:
     """List all past and current work sessions.
 
@@ -393,10 +476,7 @@ def list_sessions() -> str:
             except Exception:
                 pass
         # Count runs and design files
-        run_count = sum(
-            1 for e in os.listdir(sp)
-            if os.path.isdir(os.path.join(sp, e)) and e != "designs"
-        )
+        run_count = run_count_from_meta(meta, sp)
         designs_dir = os.path.join(sp, "designs")
         design_count = (
             len(os.listdir(designs_dir))

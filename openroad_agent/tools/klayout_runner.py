@@ -24,7 +24,11 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from openroad_agent.config import OpenROADConfig
-from openroad_agent.tools.session_manager import resolve_run_dir, get_session_name
+from openroad_agent.tools.session_manager import (
+    get_session_name,
+    register_current_run,
+    resolve_run_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +47,9 @@ def _get_cfg() -> OpenROADConfig:
 # Paths are relative to the ORFS root directory on the cluster
 # (/home/ray/OpenROAD-flow-scripts/).
 
-_ORFS_ROOT = "/home/ray/OpenROAD-flow-scripts"
-_PLATFORMS_DIR = f"{_ORFS_ROOT}/flow/platforms"
-_DEF2STREAM_SCRIPT = f"{_ORFS_ROOT}/flow/util/def2stream.py"
+# _ORFS_ROOT = "/home/ray/OpenROAD-flow-scripts"
+_PLATFORMS_DIR = f"/mnt/shared/platforms"
+_DEF2STREAM_SCRIPT = f"/mnt/shared/def2stream.py"
 
 _PLATFORM_GDS_PARAMS: dict[str, dict] = {
     "nangate45": {
@@ -111,7 +115,7 @@ def run_klayout_gds(
     Args:
         def_file: Path to the input DEF file (final routed DEF from
             OpenROAD).  Can be a remote path when running on Ray
-            (e.g. ``/mnt/shared/sessions/<session>/<run>/results/<design>_6_final.def``),
+            (e.g. ``/mnt/shared/sessions/<session>/<run>/results/<design>.def``),
             or a local absolute path.
         design_name: Top-level cell / design name (must match the DEF).
         platform: Target PDK platform (nangate45, sky130hd, sky130hs, asap7).
@@ -180,14 +184,16 @@ def _run_klayout_locally(
     # Check if klayout is available
     import shutil
     if not shutil.which(klayout_bin):
-        return json.dumps({
+        result = {
             "success": False,
             "error": (
                 f"KLayout binary '{klayout_bin}' not found locally. "
                 "GDS generation is only available on the Ray cluster "
                 "(set OPENROAD_EXEC_MODE=ray)."
             ),
-        })
+        }
+        register_current_run(run_label, "klayout", result)
+        return json.dumps(result)
 
     params = _PLATFORM_GDS_PARAMS[platform]
 
@@ -236,7 +242,7 @@ def _run_klayout_locally(
         full_stderr = proc.stderr
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
-        return json.dumps({
+        result = {
             "success": False,
             "stdout": "",
             "stderr": f"KLayout timeout after {timeout_seconds}s",
@@ -244,7 +250,9 @@ def _run_klayout_locally(
             "run_dir": os.path.abspath(run_dir),
             "remote": False,
             "tool": "klayout",
-        })
+        }
+        register_current_run(run_label, "klayout", result)
+        return json.dumps(result)
 
     # Persist logs
     log_file = os.path.join(run_dir, f"{run_label}.log")
@@ -260,7 +268,7 @@ def _run_klayout_locally(
 
     gds_exists = os.path.isfile(out_gds)
 
-    return json.dumps({
+    result = {
         "success": success and gds_exists,
         "stdout": stdout,
         "stderr": stderr,
@@ -270,7 +278,9 @@ def _run_klayout_locally(
         "run_dir": os.path.abspath(run_dir),
         "remote": False,
         "tool": "klayout",
-    })
+    }
+    register_current_run(run_label, "klayout", result)
+    return json.dumps(result)
 
 
 def _run_klayout_via_ray(
@@ -343,6 +353,7 @@ def _run_klayout_via_ray(
 
     session = SessionManager.get_current()
     if session:
+        register_current_run(run_label, "klayout", result)
         push_session_meta_to_remote(
             session.base_dir, session.session_name, cfg.ray_address,
         )

@@ -4,7 +4,8 @@ Provides the LLM agent with the ability to save user-provided RTL Verilog,
 SDC constraints, or other design files to the local work directory so they
 can be used by Yosys synthesis and OpenROAD physical design flows.
 
-Files are stored under ``<work_dir>/designs/<design_name>/``.
+Files may be stored either under ``<work_dir>/designs/<design_name>/`` or
+directly in ``<work_dir>/designs/`` when uploaded through the web UI.
 """
 
 from __future__ import annotations
@@ -42,6 +43,60 @@ def _designs_root() -> str:
     d = os.path.join(cfg.work_dir, "designs")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _file_entry(root: str, fp: str) -> dict[str, str | int]:
+    """Return a JSON-serialisable file description."""
+    return {
+        "name": os.path.basename(fp),
+        "relative_path": os.path.relpath(fp, root),
+        "path": os.path.abspath(fp),
+        "size_bytes": os.path.getsize(fp),
+    }
+
+
+def _root_files(root: str) -> list[dict[str, str | int]]:
+    """List files stored directly in the designs root."""
+    files: list[dict[str, str | int]] = []
+    if not os.path.isdir(root):
+        return files
+    for entry in sorted(os.listdir(root)):
+        fp = os.path.join(root, entry)
+        if os.path.isfile(fp):
+            files.append(_file_entry(root, fp))
+    return files
+
+
+def _design_subdirs(root: str) -> dict[str, dict[str, str | list[dict[str, str | int]]]]:
+    """List files grouped by design sub-directory."""
+    designs: dict[str, dict[str, str | list[dict[str, str | int]]]] = {}
+    if not os.path.isdir(root):
+        return designs
+    for design_name in sorted(os.listdir(root)):
+        design_dir = os.path.join(root, design_name)
+        if not os.path.isdir(design_dir):
+            continue
+        files: list[dict[str, str | int]] = []
+        for base, _dirs, filenames in os.walk(design_dir):
+            for filename in sorted(filenames):
+                fp = os.path.join(base, filename)
+                files.append(_file_entry(root, fp))
+        designs[design_name] = {
+            "path": os.path.abspath(design_dir),
+            "files": files,
+        }
+    return designs
+
+
+def _matching_root_files(root: str, design_name: str) -> list[dict[str, str | int]]:
+    """Find files in the root that likely belong to the given design."""
+    matches: list[dict[str, str | int]] = []
+    for entry in _root_files(root):
+        rel = str(entry["relative_path"])
+        stem = Path(rel).stem
+        if stem == design_name or stem.startswith(f"{design_name}_") or rel.startswith(f"{design_name}."):
+            matches.append(entry)
+    return matches
 
 
 @tool
@@ -99,31 +154,30 @@ def list_design_files(design_name: str = "") -> str:
 
     if design_name:
         design_dir = os.path.join(root, design_name)
-        if not os.path.isdir(design_dir):
-            return json.dumps({"error": f"Design '{design_name}' not found."})
-        files = []
-        for f in sorted(os.listdir(design_dir)):
-            fp = os.path.join(design_dir, f)
-            if os.path.isfile(fp):
-                files.append({
-                    "name": f,
-                    "path": os.path.abspath(fp),
-                    "size_bytes": os.path.getsize(fp),
-                })
-        return json.dumps({"design": design_name, "files": files})
+        subdir_files: list[dict[str, str | int]] = []
+        if os.path.isdir(design_dir):
+            for base, _dirs, filenames in os.walk(design_dir):
+                for filename in sorted(filenames):
+                    subdir_files.append(_file_entry(root, os.path.join(base, filename)))
 
-    # List all designs
-    designs = {}
-    if os.path.isdir(root):
-        for d in sorted(os.listdir(root)):
-            dp = os.path.join(root, d)
-            if os.path.isdir(dp):
-                files = [f for f in os.listdir(dp) if os.path.isfile(os.path.join(dp, f))]
-                designs[d] = {
-                    "path": os.path.abspath(dp),
-                    "files": sorted(files),
-                }
-    return json.dumps(designs)
+        root_matches = _matching_root_files(root, design_name)
+        files = subdir_files + [f for f in root_matches if f not in subdir_files]
+        if not files:
+            return json.dumps({
+                "error": f"Design '{design_name}' not found.",
+                "available_root_files": _root_files(root),
+                "available_designs": sorted(_design_subdirs(root).keys()),
+            })
+
+        return json.dumps({
+            "design": design_name,
+            "files": files,
+        }, indent=2)
+
+    return json.dumps({
+        "root_files": _root_files(root),
+        "design_directories": _design_subdirs(root),
+    }, indent=2)
 
 
 @tool
@@ -138,7 +192,15 @@ def read_design_file(file_path: str) -> str:
     """
     if not os.path.isabs(file_path):
         root = _designs_root()
-        file_path = os.path.join(root, file_path)
+        candidate = os.path.join(root, file_path)
+        if os.path.exists(candidate):
+            file_path = candidate
+        else:
+            matches = list(Path(root).rglob(Path(file_path).name))
+            if len(matches) == 1:
+                file_path = str(matches[0])
+            else:
+                file_path = candidate
 
     try:
         with open(file_path, "r") as f:

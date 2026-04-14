@@ -19,7 +19,11 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from openroad_agent.config import OpenROADConfig
-from openroad_agent.tools.session_manager import resolve_run_dir, get_session_name
+from openroad_agent.tools.session_manager import (
+    get_session_name,
+    register_current_run,
+    resolve_run_dir,
+)
 
 
 # ── lazy config ────────────────────────────────────────────────────────
@@ -392,7 +396,7 @@ def _run_yosys_locally(
         full_stderr = proc.stderr
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
-        return json.dumps({
+        result = {
             "success": False,
             "stdout": "",
             "stderr": f"Yosys timeout after {timeout_seconds}s",
@@ -402,7 +406,9 @@ def _run_yosys_locally(
             "run_dir": os.path.abspath(run_dir),
             "remote": False,
             "tool": "yosys",
-        })
+        }
+        register_current_run(run_label, "yosys", result)
+        return json.dumps(result)
 
     # Persist logs
     log_file = os.path.join(run_dir, f"{run_label}.log")
@@ -426,7 +432,7 @@ def _run_yosys_locally(
 
     metrics = _parse_yosys_metrics(full_stdout)
 
-    return json.dumps({
+    result = {
         "success": success,
         "stdout": stdout,
         "stderr": stderr,
@@ -438,7 +444,9 @@ def _run_yosys_locally(
         "run_dir": os.path.abspath(run_dir),
         "remote": False,
         "tool": "yosys",
-    })
+    }
+    register_current_run(run_label, "yosys", result)
+    return json.dumps(result)
 
 
 # ── Ray remote Yosys execution ────────────────────────────────────────
@@ -527,6 +535,7 @@ def _run_yosys_via_ray(
 
     session = SessionManager.get_current()
     if session:
+        register_current_run(run_label, "yosys", result)
         push_session_meta_to_remote(
             session.base_dir, session.session_name, cfg.ray_address,
         )

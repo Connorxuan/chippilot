@@ -20,7 +20,11 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from openroad_agent.config import OpenROADConfig
-from openroad_agent.tools.session_manager import resolve_run_dir, get_session_name
+from openroad_agent.tools.session_manager import (
+    get_session_name,
+    register_current_run,
+    resolve_run_dir,
+)
 
 
 def _get_cfg() -> OpenROADConfig:
@@ -194,6 +198,7 @@ def _run_via_ray(
 
     session = SessionManager.get_current()
     if session:
+        register_current_run(run_label, "openroad", result)
         push_session_meta_to_remote(
             session.base_dir, session.session_name, cfg.ray_address,
         )
@@ -251,7 +256,7 @@ def _run_locally(
         stderr = full_stderr[-4000:] if len(full_stderr) > 4000 else full_stderr
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
-        return json.dumps({
+        result = {
             "success": False,
             "stdout": "",
             "stderr": f"Timeout after {timeout_seconds}s",
@@ -261,7 +266,9 @@ def _run_locally(
             "log_file": "",
             "run_dir": os.path.abspath(run_dir),
             "remote": False,
-        })
+        }
+        register_current_run(run_label, "openroad", result)
+        return json.dumps(result)
 
     # Collect result files
     result_files = []
@@ -282,7 +289,7 @@ def _run_locally(
             except Exception:
                 pass
 
-    return json.dumps({
+    result = {
         "success": success,
         "stdout": stdout,
         "stderr": stderr,
@@ -293,7 +300,9 @@ def _run_locally(
         "log_file": stdout_log,
         "run_dir": os.path.abspath(run_dir),
         "remote": False,
-    })
+    }
+    register_current_run(run_label, "openroad", result)
+    return json.dumps(result)
 
 
 @tool
