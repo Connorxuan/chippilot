@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from openroad_agent.storage import ChippilotStore
+
 
 COOKIE_NAME = "chippilot_session"
 TOKEN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -32,12 +34,14 @@ class AuthUser:
 
 
 class AuthStore:
-    """Tiny JSON-backed user store with signed-cookie sessions."""
+    """SQLite-backed local user store with signed-cookie sessions."""
 
     def __init__(self, work_dir: str) -> None:
         self.work_dir = Path(work_dir)
         self.users_path = self.work_dir / "users.json"
         self.users_root = self.work_dir / "users"
+        self.store = ChippilotStore(self.work_dir)
+        self._initialized = False
         self._secret = os.environ.get("CHIPPILOT_SECRET_KEY")
         if not self._secret:
             self._secret = secrets.token_urlsafe(32)
@@ -47,12 +51,17 @@ class AuthStore:
             )
 
     def ensure_initialized(self) -> None:
+        if self._initialized:
+            return
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.users_root.mkdir(parents=True, exist_ok=True)
-        if not self.users_path.exists():
-            self._write_users({"users": {}})
+        self.store.initialize()
+        self.migrate_users_json()
         self.ensure_admin_placeholder()
         self.migrate_legacy_sessions()
+        self.index_existing_sessions()
+        self.store.fail_interrupted_jobs("Server restarted before this job finished.")
+        self._initialized = True
 
     def public_user(self, user: dict[str, Any]) -> AuthUser:
         return AuthUser(
@@ -70,38 +79,30 @@ class AuthStore:
         return root
 
     def get_user_by_id(self, user_id: str) -> AuthUser | None:
-        raw = self._read_users()["users"].get(user_id)
+        raw = self.store.get_user_by_id(user_id)
         return self.public_user(raw) if raw else None
 
     def get_user_record_by_username(self, username: str) -> dict[str, Any] | None:
-        users = self._read_users()["users"]
-        lowered = username.lower()
-        for raw in users.values():
-            if raw["username"].lower() == lowered:
-                return raw
-        return None
+        return self.store.get_user_by_username(username)
 
     def register(self, username: str, password: str) -> AuthUser:
         username = username.strip()
         self._validate_username(username)
         self._validate_password(password)
 
-        data = self._read_users()
         existing = self.get_user_record_by_username(username)
         if existing:
             if existing.get("disabled_password") and existing["username"].lower() == "admin":
                 existing.update(self._password_fields(password))
                 existing["disabled_password"] = False
                 existing["created_at"] = existing.get("created_at") or self._now()
-                data["users"][existing["user_id"]] = existing
-                self._write_users(data)
+                self.store.upsert_user(existing)
                 self.user_root(existing)
                 return self.public_user(existing)
             raise ValueError("Username is already registered.")
 
         user_id = self._safe_user_id(username)
-        users = data["users"]
-        if user_id in users:
+        if self.store.user_exists(user_id):
             user_id = f"{user_id}_{secrets.token_hex(3)}"
 
         raw = {
@@ -110,8 +111,7 @@ class AuthStore:
             "created_at": self._now(),
             **self._password_fields(password),
         }
-        users[user_id] = raw
-        self._write_users(data)
+        self.store.create_user(raw)
         self.user_root(raw)
         return self.public_user(raw)
 
@@ -151,10 +151,9 @@ class AuthStore:
         return self.get_user_by_id(user_id)
 
     def ensure_admin_placeholder(self) -> None:
-        data = self._read_users()
-        users = data["users"]
-        if "admin" in users:
-            self.user_root(users["admin"])
+        existing = self.store.get_user_by_id("admin")
+        if existing:
+            self.user_root(existing)
             return
         admin_password = os.environ.get("CHIPPILOT_ADMIN_PASSWORD")
         raw = {
@@ -172,9 +171,28 @@ class AuthStore:
                     "disabled_password": True,
                 }
             )
-        users["admin"] = raw
-        self._write_users(data)
+        self.store.upsert_user(raw)
         self.user_root(raw)
+
+    def migrate_users_json(self) -> None:
+        if not self.users_path.exists():
+            return
+        try:
+            with self.users_path.open() as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        users = data.get("users", {})
+        if not isinstance(users, dict):
+            return
+        for raw in users.values():
+            if not isinstance(raw, dict) or not raw.get("user_id") or not raw.get("username"):
+                continue
+            raw.setdefault("created_at", self._now())
+            raw.setdefault("password_hash", "")
+            raw.setdefault("salt", "")
+            raw["disabled_password"] = bool(raw.get("disabled_password"))
+            self.store.upsert_user(raw)
 
     def migrate_legacy_sessions(self) -> None:
         legacy_root = self.work_dir / "sessions"
@@ -190,11 +208,43 @@ class AuthStore:
             if target.exists():
                 continue
             shutil.move(str(path), str(target))
+            self._index_session_dir("admin", target)
 
         try:
             legacy_root.rmdir()
         except OSError:
             pass
+
+    def index_existing_sessions(self) -> None:
+        if not self.users_root.is_dir():
+            return
+        for user_dir in sorted(self.users_root.iterdir()):
+            sessions_dir = user_dir / "sessions"
+            if not sessions_dir.is_dir():
+                continue
+            for session_dir in sorted(sessions_dir.iterdir()):
+                if session_dir.is_dir():
+                    self._index_session_dir(user_dir.name, session_dir)
+
+    def _index_session_dir(self, user_id: str, session_dir: Path) -> None:
+        meta_path = session_dir / "session.json"
+        meta: dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                with meta_path.open() as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+        session_name = meta.get("session_name") or session_dir.name
+        if session_name != session_dir.name:
+            session_name = session_dir.name
+        self.store.upsert_session(
+            user_id=user_id,
+            session_name=session_name,
+            path=session_dir,
+            name_hint=meta.get("name_hint", ""),
+            created_at=str(meta.get("created", "")),
+        )
 
     def _read_users(self) -> dict[str, Any]:
         self.work_dir.mkdir(parents=True, exist_ok=True)

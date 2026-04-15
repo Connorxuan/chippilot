@@ -149,107 +149,305 @@ function renderInlineMarkdown(text, keyPrefix) {
   });
 }
 
-function renderMarkdownBlock(text, keyPrefix) {
+function renderMarkdownNode(node, keyPrefix) {
+  if (node.type === "paragraph") {
+    return (
+      <p className="message-paragraph" key={keyPrefix}>
+        {renderInlineMarkdown(node.text, keyPrefix)}
+      </p>
+    );
+  }
+
+  if (node.type === "heading") {
+    const Tag = `h${node.level}`;
+    return (
+      <Tag className="message-heading" key={keyPrefix}>
+        {renderInlineMarkdown(node.text, keyPrefix)}
+      </Tag>
+    );
+  }
+
+  if (node.type === "quote") {
+    return (
+      <blockquote className="message-quote" key={keyPrefix}>
+        {renderInlineMarkdown(node.text, keyPrefix)}
+      </blockquote>
+    );
+  }
+
+  if (node.type === "list") {
+    const Tag = node.ordered ? "ol" : "ul";
+    const startProps = node.ordered && node.start > 1 ? { start: node.start } : {};
+    return (
+      <Tag className="message-list-block" key={keyPrefix} {...startProps}>
+        {node.items.map((item, itemIndex) => (
+          <li key={`${keyPrefix}-li-${itemIndex}`}>
+            {item.blocks.map((child, childIndex) =>
+              renderMarkdownNode(child, `${keyPrefix}-${itemIndex}-${childIndex}`),
+            )}
+          </li>
+        ))}
+      </Tag>
+    );
+  }
+
+  if (node.type === "table") {
+    return (
+      <div className="message-table-wrap" key={keyPrefix}>
+        <table className="message-table">
+          <thead>
+            <tr>
+              {node.headers.map((header, cellIndex) => (
+                <th
+                  key={`${keyPrefix}-th-${cellIndex}`}
+                  style={{ textAlign: node.align[cellIndex] || "left" }}
+                >
+                  {renderInlineMarkdown(header, `${keyPrefix}-th-${cellIndex}`)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {node.rows.map((row, rowIndex) => (
+              <tr key={`${keyPrefix}-tr-${rowIndex}`}>
+                {node.headers.map((_header, cellIndex) => (
+                  <td
+                    key={`${keyPrefix}-td-${rowIndex}-${cellIndex}`}
+                    style={{ textAlign: node.align[cellIndex] || "left" }}
+                  >
+                    {renderInlineMarkdown(row[cellIndex] || "", `${keyPrefix}-td-${rowIndex}-${cellIndex}`)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+function parseMarkdownBlock(text) {
   const lines = text.split("\n");
   const elements = [];
   let paragraph = [];
-  let listItems = [];
-  let listType = null;
+  const listStack = [];
+
+  function leadingIndent(raw) {
+    const match = raw.match(/^[\t ]*/);
+    return (match ? match[0] : "").replace(/\t/g, "    ").length;
+  }
+
+  function currentListItem() {
+    const current = listStack[listStack.length - 1];
+    if (!current || !current.node.items.length) {
+      return null;
+    }
+    return current.node.items[current.node.items.length - 1];
+  }
+
+  function appendNode(node) {
+    const item = currentListItem();
+    if (item) {
+      item.blocks.push(node);
+    } else {
+      elements.push(node);
+    }
+  }
 
   function flushParagraph() {
     if (!paragraph.length) {
       return;
     }
-    elements.push(
-      <p className="message-paragraph" key={`${keyPrefix}-p-${elements.length}`}>
-        {renderInlineMarkdown(paragraph.join(" "), `${keyPrefix}-p-${elements.length}`)}
-      </p>,
-    );
+    appendNode({ type: "paragraph", text: paragraph.join(" ") });
     paragraph = [];
   }
 
-  function flushList() {
-    if (!listItems.length || !listType) {
-      return;
+  function closeListsTo(depth) {
+    while (listStack.length > depth) {
+      listStack.pop();
     }
-    const Tag = listType === "ol" ? "ol" : "ul";
-    elements.push(
-      <Tag className="message-list-block" key={`${keyPrefix}-list-${elements.length}`}>
-        {listItems.map((item, index) => (
-          <li key={`${keyPrefix}-li-${index}`}>
-            {renderInlineMarkdown(item, `${keyPrefix}-li-${index}`)}
-          </li>
-        ))}
-      </Tag>,
-    );
-    listItems = [];
-    listType = null;
   }
 
-  lines.forEach((line) => {
-    const trimmed = line.trim();
+  function appendListItem(indent, listType, start, content) {
+    flushParagraph();
+
+    while (listStack.length) {
+      const current = listStack[listStack.length - 1];
+      if (indent < current.indent || (indent === current.indent && listType !== current.listType)) {
+        listStack.pop();
+        continue;
+      }
+      break;
+    }
+
+    const current = listStack[listStack.length - 1];
+    if (!current || indent > current.indent || current.listType !== listType) {
+      const node = {
+        type: "list",
+        ordered: listType === "ol",
+        start,
+        items: [],
+      };
+      appendNode(node);
+      listStack.push({ node, indent, listType });
+    }
+
+    const target = listStack[listStack.length - 1].node;
+    target.items.push({
+      blocks: content ? [{ type: "paragraph", text: content }] : [],
+    });
+  }
+
+  function splitTableRow(raw) {
+    let text = raw.trim();
+    if (!text.includes("|")) {
+      return null;
+    }
+    if (text.startsWith("|")) {
+      text = text.slice(1);
+    }
+    if (text.endsWith("|")) {
+      text = text.slice(0, -1);
+    }
+
+    const cells = [];
+    let cell = "";
+    let escaped = false;
+    for (const char of text) {
+      if (escaped) {
+        cell += char;
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "|") {
+        cells.push(cell.trim());
+        cell = "";
+        continue;
+      }
+      cell += char;
+    }
+    cells.push(cell.trim());
+    return cells.length > 1 ? cells : null;
+  }
+
+  function parseTableSeparator(raw, expectedCells) {
+    const cells = splitTableRow(raw);
+    if (!cells || cells.length < expectedCells) {
+      return null;
+    }
+    const align = [];
+    for (const cell of cells.slice(0, expectedCells)) {
+      const compact = cell.replace(/\s+/g, "");
+      if (!/^:?-{3,}:?$/.test(compact)) {
+        return null;
+      }
+      if (compact.startsWith(":") && compact.endsWith(":")) {
+        align.push("center");
+      } else if (compact.endsWith(":")) {
+        align.push("right");
+      } else {
+        align.push("left");
+      }
+    }
+    return align;
+  }
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const rawLine = lines[lineIndex];
+    const trimmed = rawLine.trim();
 
     if (!trimmed) {
       flushParagraph();
-      flushList();
-      return;
+      continue;
     }
 
     const headingMatch = trimmed.match(/^(#{1,3})\s+(.*)$/);
     if (headingMatch) {
       flushParagraph();
-      flushList();
+      closeListsTo(0);
       const level = Math.min(headingMatch[1].length, 3);
-      const Tag = `h${level}`;
-      elements.push(
-        <Tag className="message-heading" key={`${keyPrefix}-h-${elements.length}`}>
-          {renderInlineMarkdown(headingMatch[2], `${keyPrefix}-h-${elements.length}`)}
-        </Tag>,
-      );
-      return;
+      elements.push({ type: "heading", level, text: headingMatch[2] });
+      continue;
     }
 
-    const unorderedMatch = trimmed.match(/^[-*]\s+(.*)$/);
-    if (unorderedMatch) {
+    const tableHeader = splitTableRow(rawLine);
+    const tableAlign = tableHeader
+      ? parseTableSeparator(lines[lineIndex + 1] || "", tableHeader.length)
+      : null;
+    if (tableHeader && tableAlign) {
       flushParagraph();
-      if (listType && listType !== "ul") {
-        flushList();
+      const tableIndent = leadingIndent(rawLine);
+      if (!listStack.length || tableIndent <= listStack[listStack.length - 1].indent) {
+        closeListsTo(0);
       }
-      listType = "ul";
-      listItems.push(unorderedMatch[1]);
-      return;
+      const rows = [];
+      lineIndex += 2;
+      while (lineIndex < lines.length) {
+        const row = splitTableRow(lines[lineIndex]);
+        if (!row) {
+          lineIndex -= 1;
+          break;
+        }
+        rows.push(row.slice(0, tableHeader.length));
+        lineIndex += 1;
+      }
+      appendNode({
+        type: "table",
+        headers: tableHeader,
+        align: tableAlign,
+        rows,
+      });
+      continue;
     }
 
-    const orderedMatch = trimmed.match(/^\d+\.\s+(.*)$/);
-    if (orderedMatch) {
-      flushParagraph();
-      if (listType && listType !== "ol") {
-        flushList();
-      }
-      listType = "ol";
-      listItems.push(orderedMatch[1]);
-      return;
+    const listMatch = rawLine.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/);
+    if (listMatch) {
+      const marker = listMatch[2];
+      const listType = /^\d+\.$/.test(marker) ? "ol" : "ul";
+      const start = listType === "ol" ? Number.parseInt(marker, 10) : 1;
+      appendListItem(leadingIndent(rawLine), listType, start, listMatch[3]);
+      continue;
     }
 
     const quoteMatch = trimmed.match(/^>\s+(.*)$/);
     if (quoteMatch) {
       flushParagraph();
-      flushList();
-      elements.push(
-        <blockquote className="message-quote" key={`${keyPrefix}-q-${elements.length}`}>
-          {renderInlineMarkdown(quoteMatch[1], `${keyPrefix}-q-${elements.length}`)}
-        </blockquote>,
-      );
-      return;
+      closeListsTo(0);
+      elements.push({ type: "quote", text: quoteMatch[1] });
+      continue;
     }
 
-    flushList();
+    if (listStack.length) {
+      const current = listStack[listStack.length - 1];
+      if (leadingIndent(rawLine) > current.indent) {
+        const item = currentListItem();
+        if (item) {
+          item.blocks.push({ type: "paragraph", text: trimmed });
+          continue;
+        }
+      }
+      closeListsTo(0);
+    }
+
     paragraph.push(trimmed);
-  });
+  }
 
   flushParagraph();
-  flushList();
+  closeListsTo(0);
   return elements;
+}
+
+function renderMarkdownBlock(text, keyPrefix) {
+  return parseMarkdownBlock(text).map((node, index) =>
+    renderMarkdownNode(node, `${keyPrefix}-md-${index}`),
+  );
 }
 
 function MessageBody({ content, markdown = false }) {
@@ -656,6 +854,7 @@ function App() {
   const messageListRef = useRef(null);
   const messagesEndRef = useRef(null);
   const shouldAutoScrollRef = useRef(true);
+  const jobSourceRef = useRef(null);
 
   function clearWorkspace() {
     setSessions([]);
@@ -780,11 +979,22 @@ function App() {
   }
 
   async function handleLogout() {
+    if (jobSourceRef.current) {
+      jobSourceRef.current.close();
+      jobSourceRef.current = null;
+    }
     await fetchJson("/api/auth/logout", { method: "POST" }).catch(() => null);
     setAuthUser(null);
     clearWorkspace();
     setError("");
   }
+
+  useEffect(() => () => {
+    if (jobSourceRef.current) {
+      jobSourceRef.current.close();
+      jobSourceRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     shouldAutoScrollRef.current = true;
@@ -813,46 +1023,63 @@ function App() {
     }
   }, [activeDetail, busy]);
 
-  useEffect(() => {
-    if (!busy || !activeSession) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    let inFlight = false;
-
-    async function pollActiveSession() {
-      if (inFlight) {
-        return;
+  function watchJob(jobId, fallbackSession) {
+    return new Promise((resolve, reject) => {
+      if (jobSourceRef.current) {
+        jobSourceRef.current.close();
       }
 
-      inFlight = true;
-      try {
-        const detail = await fetchJson(`/api/sessions/${encodeURIComponent(activeSession)}`);
-        if (!cancelled) {
-          if (detail.session_name && detail.session_name !== activeSession) {
-            setActiveSession(detail.session_name);
-          }
-          setActiveDetail((current) => mergeLiveDetail(current, detail));
+      const source = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/events`);
+      jobSourceRef.current = source;
+      let closed = false;
+
+      function close() {
+        if (closed) {
+          return;
         }
-      } catch (err) {
-        if (!cancelled) {
+        closed = true;
+        source.close();
+        if (jobSourceRef.current === source) {
+          jobSourceRef.current = null;
+        }
+      }
+
+      async function refreshSession(sessionName) {
+        if (!sessionName) {
+          return;
+        }
+        const detail = await fetchJson(`/api/sessions/${encodeURIComponent(sessionName)}`);
+        setActiveSession(detail.session_name);
+        setActiveDetail((current) => mergeLiveDetail(current, detail));
+        await refreshSessions(detail.session_name);
+      }
+
+      source.onmessage = (event) => {
+        const data = JSON.parse(event.data || "{}");
+        const job = data.job || {};
+        const sessionName = data.session_name || job.session_name || fallbackSession;
+
+        refreshSession(sessionName).catch((err) => {
           console.warn("Unable to refresh live agent activity", err);
+        });
+
+        if (job.status === "completed") {
+          close();
+          refreshSession(sessionName).finally(() => resolve(data));
+        } else if (job.status === "failed" || job.status === "cancelled") {
+          close();
+          refreshSession(sessionName).finally(() => {
+            reject(new Error(job.error || "Agent job failed."));
+          });
         }
-      } finally {
-        inFlight = false;
-      }
-    }
+      };
 
-    const initialPoll = window.setTimeout(pollActiveSession, 250);
-    const pollTimer = window.setInterval(pollActiveSession, 900);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(initialPoll);
-      window.clearInterval(pollTimer);
-    };
-  }, [busy, activeSession]);
+      source.onerror = () => {
+        close();
+        reject(new Error("Lost live agent connection."));
+      };
+    });
+  }
 
   async function handleSend(overrideText) {
     const content = (overrideText || draft).trim();
@@ -879,6 +1106,7 @@ function App() {
     const outgoingAttachments = [...pendingAttachments];
     const previousDetail = activeDetail;
     const previousSession = activeSession;
+    let submittedJob = false;
 
     setDraft("");
     setPendingAttachments([]);
@@ -913,15 +1141,21 @@ function App() {
         }),
       });
 
+      submittedJob = true;
       setActiveSession(payload.session.session_name);
       setActiveDetail(payload.session);
       await refreshSessions(payload.session.session_name);
+      if (payload.job?.job_id) {
+        await watchJob(payload.job.job_id, payload.session.session_name);
+      }
     } catch (err) {
-      setActiveSession(previousSession);
-      setActiveDetail(previousDetail);
+      if (!submittedJob) {
+        setActiveSession(previousSession);
+        setActiveDetail(previousDetail);
+        setDraft(content);
+        setPendingAttachments(outgoingAttachments);
+      }
       setError(err.message);
-      setDraft(content);
-      setPendingAttachments(outgoingAttachments);
     } finally {
       setBusy(false);
     }

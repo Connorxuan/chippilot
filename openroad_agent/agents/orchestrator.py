@@ -10,9 +10,9 @@ from typing import Any
 from langchain.chat_models.base import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
 from langchain.agents import create_agent
 
+from openroad_agent.checkpoint import get_sqlite_checkpointer
 from openroad_agent.config import OpenROADConfig
 from openroad_agent.prompts.system_prompts import (
     ORCHESTRATOR_PROMPT,
@@ -223,7 +223,10 @@ def _has_subagent_output(result: dict) -> bool:
 # Signature:  callback(event_type: str, agent_name: str, msg: Any) -> None
 #   event_type: "start" | "msg" | "end"
 
-_stream_callback: Any = None
+_stream_callback: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "openroad_agent_stream_callback",
+    default=None,
+)
 
 
 def _run_coro_blocking(coro):
@@ -266,8 +269,7 @@ def set_stream_callback(callback) -> None:
                   each sub-agent lifecycle event.  Set to ``None`` to
                   disable streaming (sub-agents run silently).
     """
-    global _stream_callback
-    _stream_callback = callback
+    _stream_callback.set(callback)
 
 
 # ── Sub-agent runner ───────────────────────────────────────────────────
@@ -301,7 +303,7 @@ def _make_subagent_tool(
         Returns:
             The sub-agent's final text response.
         """
-        cb = _stream_callback
+        cb = _stream_callback.get()
         if cb:
             cb("start", name, None)
 
@@ -464,5 +466,5 @@ def create_orchestrator_agent(
         model=llm,
         tools=all_agent_tools,
         system_prompt=ORCHESTRATOR_PROMPT,
-        checkpointer=MemorySaver(),
+        checkpointer=get_sqlite_checkpointer(cfg.work_dir),
     )

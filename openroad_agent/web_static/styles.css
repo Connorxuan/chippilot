@@ -749,10 +749,53 @@ button {
   margin: 0;
   padding-left: 1.4rem;
   line-height: 1.65;
+  list-style-position: outside;
 }
 
 .message-list-block li + li {
   margin-top: 6px;
+}
+
+.message-list-block .message-list-block {
+  margin-top: 6px;
+  margin-bottom: 2px;
+}
+
+.message-list-block .message-paragraph {
+  margin: 0;
+}
+
+.message-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.message-table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 0.94rem;
+  line-height: 1.5;
+}
+
+.message-table th,
+.message-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.message-table th {
+  background: rgba(15, 118, 110, 0.08);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.message-table tr:last-child td {
+  border-bottom: 0;
 }
 
 .message-quote {

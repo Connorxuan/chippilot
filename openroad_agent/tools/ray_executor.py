@@ -1,8 +1,8 @@
-"""Remote OpenROAD execution via Ray on Kubernetes.
+"""Remote OpenROAD execution via Ray Job Submission API on Kubernetes.
 
-Submits OpenROAD TCL jobs to a remote Ray cluster.  Files are transferred
-through Ray's object store (no shared filesystem needed between local and
-cluster).  Within the cluster the shared volume ``/mnt/shared/`` is used as
+Submits OpenROAD TCL jobs to a remote Ray cluster through the Ray dashboard
+Job Submission API.  A small self-contained runner is uploaded as the job
+working directory, and the cluster shared volume ``/mnt/shared/`` is used as
 the working directory so results persist across pods.
 
 Typical cluster layout (inside each pod):
@@ -15,10 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import base64
+import shutil
+import tempfile
 import time
 from typing import Any
 
-import ray
+from ray.job_submission import JobStatus, JobSubmissionClient
 
 logger = logging.getLogger(__name__)
 
@@ -28,256 +31,430 @@ _REMOTE_OPENROAD_ROOT = "/mnt/shared/OpenROAD"
 _REMOTE_TEST_DIR = f"{_REMOTE_OPENROAD_ROOT}/test"
 _REMOTE_WORK_BASE = "/mnt/shared/openroad_work"
 _REMOTE_SESSION_BASE = "/mnt/shared/sessions"
+_RESULT_MARKER = "__CHIPPILOT_RESULT_JSON__"
 
 
-# ── Singleton connection management ───────────────────────────────────
-
-_ray_initialised = False
-
-
-def _ensure_ray(address: str) -> None:
-    """Connect to the remote Ray cluster (idempotent)."""
-    global _ray_initialised
-    if _ray_initialised and ray.is_initialized():
-        return
-    logger.info("Connecting to Ray cluster at %s …", address)
-    ray.init(address=address, ignore_reinit_error=True)
-    _ray_initialised = True
-    logger.info("Ray connected.  Nodes: %d", len(ray.nodes()))
-
-
-def disconnect_ray() -> None:
-    """Gracefully disconnect from the Ray cluster."""
-    global _ray_initialised
-    if ray.is_initialized():
-        ray.shutdown()
-    _ray_initialised = False
-
-
-# ── Remote task definition ─────────────────────────────────────────────
-#
-# This function is serialized and shipped to the worker pod.
-# It must be self-contained: all imports inside the function body.
-
-@ray.remote
-def _run_openroad_remote(
-    tcl_script: str,
-    run_label: str,
-    timeout_seconds: int,
-    source_files: dict | None = None,
-    session_name: str | None = None,
-) -> dict:
-    """Execute an OpenROAD TCL script on the remote cluster node.
-
-    Steps:
-        1. Create run directory under /mnt/shared/sessions/<session>/<run_label>/
-           (or /mnt/shared/openroad_work/<run_label>/ if no session).
-        2. Write uploaded source files (netlist, SDC, etc.) to an upload/ subdir.
-        3. Write the TCL script to disk.
-        4. Execute:  bash -c 'source env.sh && openroad -no_init -exit <tcl>'
-           with cwd = OpenROAD/test  so helpers.tcl etc. resolve.
-        5. Collect stdout, stderr, result files, metrics.
-        6. Return everything as a dict (Ray serialises it back).
-    """
-    import json as _json
-    import os as _os
-    import subprocess as _sp
-    import time as _time
-
-    # env_script = "/mnt/shared/OpenROAD-flow-scripts/env.sh"
-    test_dir = "/mnt/shared/OpenROAD/test"
-    work_base = "/mnt/shared/openroad_work"
-    session_base_root = "/mnt/shared/sessions"
-
-    if session_name:
-        session_base = _os.path.join(session_base_root, session_name)
-        run_dir = _os.path.join(session_base, run_label)
-    else:
-        run_dir = _os.path.join(work_base, run_label)
-    _os.makedirs(run_dir, exist_ok=True)
-
-    results_dir = _os.path.join(run_dir, "results")
-    _os.makedirs(results_dir, exist_ok=True)
-
-    # Write uploaded source files to an upload/ subdir
-    upload_dir = _os.path.join(run_dir, "upload")
-    if source_files:
-        _os.makedirs(upload_dir, exist_ok=True)
-        for fname, content in source_files.items():
-            with open(_os.path.join(upload_dir, fname), "w") as f:
-                f.write(content)
-
-    # Substitute __UPLOAD_DIR__ placeholder with the actual path
-    tcl_script = tcl_script.replace("__UPLOAD_DIR__", upload_dir)
-
-    # Inject result_dir override right after 'source "helpers.tcl"'
-    # The remote cluster's helpers.tcl may not honour the RESULTS_DIR
-    # env var, so we explicitly override the TCL variable.
-    import re as _re
-    _result_dir_override = (
-        f'\n# ── result_dir override (injected by ray_executor) ──\n'
-        f'set result_dir "{results_dir}"\n'
-    )
-    tcl_patched = _re.sub(
-        r'(source\s+"helpers\.tcl"\s*\n)',
-        r'\1' + _result_dir_override.replace('\\', '\\\\'),
-        tcl_script,
-        count=1,
-    )
-    # Fallback: if helpers.tcl source line not found, prepend override
-    if tcl_patched == tcl_script:
-        tcl_patched = _result_dir_override + tcl_script
-
-    tcl_path = _os.path.join(run_dir, f"{run_label}.tcl")
-    with open(tcl_path, "w") as f:
-        f.write(tcl_patched)
-
-    # Build the shell command:
-    #   source env.sh  →  sets PATH, LD_LIBRARY_PATH, etc.
-    #   RESULTS_DIR=…  →  tells flow.tcl where to write results (belt & suspenders)
-    #   openroad -no_init -exit <tcl>
-    shell_cmd = (
-        # f'source {env_script} && '
-        f'export RESULTS_DIR={results_dir} && '
-        f'openroad -no_init -exit {tcl_path}'
-    )
-
-    t0 = _time.time()
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip().strip("\"'")
     try:
-        proc = _sp.run(
-            ["bash", "-c", shell_cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=test_dir,
+        return int(raw)
+    except ValueError:
+        logger.warning("%s must be an integer, got %r; using %d", name, raw, default)
+        return default
+
+
+_JOB_POLL_INTERVAL_SECONDS = _env_int("OPENROAD_RAY_JOB_POLL_INTERVAL_SECONDS", 2)
+
+
+# ── Job Submission API helpers ─────────────────────────────────────
+
+
+def _job_address(ray_address: str) -> str:
+    configured = os.environ.get("RAY_JOB_ADDRESS", "").strip().strip("\"'")
+    if configured:
+        return configured
+    if ray_address.startswith("ray://"):
+        host = ray_address[len("ray://"):].split(":", 1)[0]
+        return f"http://{host}:8265"
+    return ray_address
+
+
+def _job_client(ray_address: str) -> JobSubmissionClient:
+    return JobSubmissionClient(_job_address(ray_address))
+
+
+def _terminal_status(status: Any) -> bool:
+    return status in {
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.STOPPED,
+    } or str(status).upper().split(".")[-1] in {"SUCCEEDED", "FAILED", "STOPPED"}
+
+
+def _status_name(status: Any) -> str:
+    return str(status).upper().split(".")[-1]
+
+
+def _run_job_payload(
+    ray_address: str,
+    kind: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Submit a self-contained Ray job and return its marker JSON."""
+    client = _job_client(ray_address)
+    temp_dir = tempfile.mkdtemp(prefix="chippilot_ray_job_")
+    try:
+        runner_path = os.path.join(temp_dir, "runner.py")
+        payload_path = os.path.join(temp_dir, "payload.json")
+        with open(runner_path, "w") as f:
+            f.write(_JOB_RUNNER_SOURCE)
+        with open(payload_path, "w") as f:
+            json.dump({"kind": kind, "payload": payload}, f, ensure_ascii=False)
+
+        job_id = client.submit_job(
+            entrypoint="python runner.py payload.json",
+            runtime_env={"working_dir": temp_dir},
         )
-        elapsed = _time.time() - t0
-        success = proc.returncode == 0
+        deadline = time.time() + timeout_seconds
+        while True:
+            status = client.get_job_status(job_id)
+            if _terminal_status(status):
+                break
+            if time.time() > deadline:
+                client.stop_job(job_id)
+                logs = client.get_job_logs(job_id)
+                return {
+                    "success": False,
+                    "stdout": "",
+                    "stderr": f"Ray job {job_id} did not complete within {timeout_seconds}s",
+                    "metrics": {},
+                    "elapsed_s": timeout_seconds,
+                    "result_files": [],
+                    "run_dir": "",
+                    "remote": True,
+                    "host": "",
+                    "ray_job_id": job_id,
+                    "ray_job_logs": logs[-4000:],
+                }
+            time.sleep(_JOB_POLL_INTERVAL_SECONDS)
+
+        logs = client.get_job_logs(job_id)
+        result = _extract_job_result(logs)
+        if not result:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": f"Ray job {job_id} finished without a Chippilot result marker.",
+                "metrics": {},
+                "elapsed_s": 0,
+                "result_files": [],
+                "run_dir": "",
+                "remote": True,
+                "host": "",
+                "ray_job_id": job_id,
+                "ray_job_logs": logs[-4000:],
+            }
+        result.setdefault("remote", True)
+        result["ray_job_id"] = job_id
+        if _status_name(status) != "SUCCEEDED" and result.get("success") is not True:
+            result["stderr"] = result.get("stderr") or f"Ray job ended with status {status}."
+        return result
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _extract_job_result(logs: str) -> dict[str, Any] | None:
+    for line in reversed(logs.splitlines()):
+        if line.startswith(_RESULT_MARKER):
+            try:
+                return json.loads(line[len(_RESULT_MARKER):])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+_JOB_RUNNER_SOURCE = r'''
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+MARKER = "__CHIPPILOT_RESULT_JSON__"
+REMOTE_OPENROAD_ROOT = "/mnt/shared/OpenROAD"
+REMOTE_TEST_DIR = f"{REMOTE_OPENROAD_ROOT}/test"
+REMOTE_WORK_BASE = "/mnt/shared/openroad_work"
+REMOTE_SESSION_BASE = "/mnt/shared/sessions"
+
+
+def emit(result):
+    print(MARKER + json.dumps(result, ensure_ascii=False), flush=True)
+
+
+def run_dir_for(session_name, run_label):
+    if session_name:
+        return os.path.join(REMOTE_SESSION_BASE, session_name, run_label)
+    return os.path.join(REMOTE_WORK_BASE, run_label)
+
+
+def write_sources(base_dir, source_files, subdir):
+    target = os.path.join(base_dir, subdir)
+    if source_files:
+        os.makedirs(target, exist_ok=True)
+        for fname, content in source_files.items():
+            with open(os.path.join(target, fname), "w") as f:
+                f.write(content)
+    return target
+
+
+def collect_files(*dirs):
+    result = []
+    for directory in dirs:
+        if os.path.isdir(directory):
+            for fname in os.listdir(directory):
+                result.append(os.path.join(directory, fname))
+    return result
+
+
+def run_openroad(payload):
+    tcl_script = payload["tcl_script"]
+    run_label = payload["run_label"]
+    timeout_seconds = int(payload["timeout_seconds"])
+    run_dir = run_dir_for(payload.get("session_name"), run_label)
+    os.makedirs(run_dir, exist_ok=True)
+    results_dir = os.path.join(run_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    upload_dir = write_sources(run_dir, payload.get("source_files"), "upload")
+    tcl_script = tcl_script.replace("__UPLOAD_DIR__", upload_dir)
+    result_dir_override = f'\n# result_dir override (injected by ray job)\nset result_dir "{results_dir}"\n'
+    patched = re.sub(r'(source\s+"helpers\.tcl"\s*\n)', r'\1' + result_dir_override.replace("\\", "\\\\"), tcl_script, count=1)
+    if patched == tcl_script:
+        patched = result_dir_override + tcl_script
+    tcl_path = os.path.join(run_dir, f"{run_label}.tcl")
+    with open(tcl_path, "w") as f:
+        f.write(patched)
+    shell_cmd = f"export RESULTS_DIR={results_dir} && openroad -no_init -exit {tcl_path}"
+    t0 = time.time()
+    try:
+        proc = subprocess.run(["bash", "-c", shell_cmd], capture_output=True, text=True, timeout=timeout_seconds, cwd=REMOTE_TEST_DIR)
+        elapsed = time.time() - t0
         full_stdout = proc.stdout
         full_stderr = proc.stderr
-    except _sp.TimeoutExpired:
-        elapsed = _time.time() - t0
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Timeout after {timeout_seconds}s",
-            "metrics": {},
-            "elapsed_s": round(elapsed, 2),
-            "result_files": [],
-            "tcl_path": tcl_path,
-            "log_file": "",
-            "run_dir": run_dir,
-            "remote": True,
-            "host": _os.uname().nodename,
-        }
-
-    # ── Persist full logs ──────────────────────────────────────────────
-    log_file = _os.path.join(run_dir, f"{run_label}.log")
-    with open(log_file, "w") as lf:
-        lf.write(full_stdout)
+        success = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return {"success": False, "stdout": "", "stderr": f"Timeout after {timeout_seconds}s", "metrics": {}, "elapsed_s": round(elapsed, 2), "result_files": [], "tcl_path": tcl_path, "log_file": "", "run_dir": run_dir, "remote": True, "host": os.uname().nodename}
+    log_file = os.path.join(run_dir, f"{run_label}.log")
+    with open(log_file, "w") as f:
+        f.write(full_stdout)
     if full_stderr:
-        stderr_log = _os.path.join(run_dir, f"{run_label}.stderr.log")
-        with open(stderr_log, "w") as lf:
-            lf.write(full_stderr)
-
-    # ── Truncate for JSON response ─────────────────────────────────────
-    stdout = full_stdout[-8000:] if len(full_stdout) > 8000 else full_stdout
-    stderr = full_stderr[-4000:] if len(full_stderr) > 4000 else full_stderr
-
-    # ── Collect result files ───────────────────────────────────────────
-    result_files: list[str] = []
-    if _os.path.isdir(results_dir):
-        for fname in _os.listdir(results_dir):
-            result_files.append(_os.path.join(results_dir, fname))
-
-    # ── Parse metrics from stdout ──────────────────────────────────────
-    import re as _re2
-    metrics: dict = {}
-
-    # 1) Worst slack (min / max)
-    for m in _re2.finditer(
-        r'worst slack\s+(min|max)\s+([-\d.]+)', full_stdout, _re2.IGNORECASE
-    ):
+        with open(os.path.join(run_dir, f"{run_label}.stderr.log"), "w") as f:
+            f.write(full_stderr)
+    metrics = {}
+    for m in re.finditer(r"worst slack\s+(min|max)\s+([-\d.]+)", full_stdout, re.IGNORECASE):
         metrics[f"worst_slack_{m.group(1)}"] = float(m.group(2))
-
-    # 2) TNS
-    m = _re2.search(r'tns\s+([-\d.]+)', full_stdout, _re2.IGNORECASE)
+    m = re.search(r"tns\s+([-\d.]+)", full_stdout, re.IGNORECASE)
     if m:
         metrics["tns"] = float(m.group(1))
-
-    # 3) Design area & utilization  (e.g.  "Design area 578 u^2 10% utilization.")
-    m = _re2.search(
-        r'Design area\s+([\d.]+)\s+u\^2\s+([\d.]+)%\s+utilization',
-        full_stdout,
-    )
+    m = re.search(r"Design area\s+([\d.]+)\s+u\^2\s+([\d.]+)%\s+utilization", full_stdout)
     if m:
-        metrics["design_area_um2"] = float(m.group(1))
-        metrics["utilization_pct"] = float(m.group(2))
-
-    # 4) Total power (last Total line from report_power)
-    for m in _re2.finditer(
-        r'^Total\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)',
-        full_stdout,
-        _re2.MULTILINE,
-    ):
+        metrics["design_area_um2"] = float(m.group(1)); metrics["utilization_pct"] = float(m.group(2))
+    for m in re.finditer(r"^Total\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)\s+([\d.e+-]+)", full_stdout, re.MULTILINE):
         metrics["internal_power"] = float(m.group(1))
         metrics["switching_power"] = float(m.group(2))
         metrics["leakage_power"] = float(m.group(3))
         metrics["total_power"] = float(m.group(4))
-
-    # 5) DRC violations
-    m = _re2.search(r'Number of violations\s*=\s*(\d+)', full_stdout)
+    m = re.search(r"Number of violations\s*=\s*(\d+)", full_stdout)
     if m:
         metrics["drc_violations"] = int(m.group(1))
-
-    # 6) Antenna violations
-    for m in _re2.finditer(
-        r'\[INFO ANT-000[12]\]\s+Found\s+(\d+)\s+(pin|net)\s+violations',
-        full_stdout,
-    ):
+    for m in re.finditer(r"\[INFO ANT-000[12]\]\s+Found\s+(\d+)\s+(pin|net)\s+violations", full_stdout):
         metrics[f"ant_{m.group(2)}_violations"] = int(m.group(1))
-
-    # 7) Instance / cell counts from GPL
-    m = _re2.search(r'\[INFO GPL-0006\]\s+Number of instances:\s+(\d+)', full_stdout)
+    m = re.search(r"\[INFO GPL-0006\]\s+Number of instances:\s+(\d+)", full_stdout)
     if m:
         metrics["num_instances"] = int(m.group(1))
-
-    # 8) Generic "metric: value" lines (fallback)
     for line in full_stdout.splitlines():
         if "metric" in line.lower() and ":" in line:
             parts = line.split(":", 1)
-            if len(parts) == 2:
-                key = parts[0].strip().split()[-1] if parts[0].strip() else ""
-                val = parts[1].strip()
-                if key and key not in metrics:
-                    try:
-                        metrics[key] = float(val)
-                    except ValueError:
-                        metrics[key] = val
-
-    # ── Also load metrics JSON files if produced ───────────────────────
-    for rf in result_files:
+            key = parts[0].strip().split()[-1] if parts[0].strip() else ""
+            val = parts[1].strip()
+            if key and key not in metrics:
+                try:
+                    metrics[key] = float(val)
+                except ValueError:
+                    metrics[key] = val
+    for rf in collect_files(results_dir):
         if rf.endswith(".metrics") or rf.endswith(".json"):
             try:
                 with open(rf) as mf:
-                    metrics.update(_json.load(mf))
+                    metrics.update(json.load(mf))
             except Exception:
                 pass
+    return {"success": success, "stdout": full_stdout[-8000:], "stderr": full_stderr[-4000:], "full_log": full_stdout, "metrics": metrics, "elapsed_s": round(elapsed, 2), "result_files": collect_files(results_dir), "tcl_path": tcl_path, "log_file": log_file, "run_dir": run_dir, "remote": True, "host": os.uname().nodename}
 
+
+def run_yosys(payload):
+    synth_script = payload["synth_script"]
+    run_label = payload["run_label"]
+    timeout_seconds = int(payload["timeout_seconds"])
+    run_dir = run_dir_for(payload.get("session_name"), run_label)
+    os.makedirs(run_dir, exist_ok=True)
+    reports_dir = os.path.join(run_dir, "reports")
+    results_dir = os.path.join(run_dir, "results")
+    os.makedirs(reports_dir, exist_ok=True); os.makedirs(results_dir, exist_ok=True)
+    src_dir = write_sources(run_dir, payload.get("source_files"), "src")
+    synth_script = synth_script.replace("__REPORTS_DIR__", reports_dir).replace("__RESULTS_DIR__", results_dir).replace("__SRC_DIR__", src_dir)
+    script_path = os.path.join(run_dir, f"{run_label}.ys")
+    with open(script_path, "w") as f:
+        f.write(synth_script)
+    yosys_bin = "/home/ray/oss-cad-suite/bin/yosys"
+    shell_cmd = f"{yosys_bin} -c {script_path}"
+    t0 = time.time()
+    try:
+        proc = subprocess.run(["bash", "-c", shell_cmd], capture_output=True, text=True, timeout=timeout_seconds, cwd=REMOTE_TEST_DIR)
+        elapsed = time.time() - t0
+        full_stdout = proc.stdout
+        full_stderr = proc.stderr
+        success = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return {"success": False, "stdout": "", "stderr": f"Yosys timeout after {timeout_seconds}s", "metrics": {}, "elapsed_s": round(elapsed, 2), "result_files": [], "script_path": script_path, "log_file": "", "run_dir": run_dir, "remote": True, "host": os.uname().nodename, "tool": "yosys"}
+    log_file = os.path.join(run_dir, f"{run_label}.log")
+    with open(log_file, "w") as f:
+        f.write(full_stdout)
+    if full_stderr:
+        with open(os.path.join(run_dir, f"{run_label}.stderr.log"), "w") as f:
+            f.write(full_stderr)
+    metrics = {}
+    m = re.search(r"Number of cells:\s+(\d+)", full_stdout)
+    if m: metrics["num_cells"] = int(m.group(1))
+    m = re.search(r"Number of wires:\s+(\d+)", full_stdout)
+    if m: metrics["num_wires"] = int(m.group(1))
+    for item in re.finditer(r"Chip area for (?:module|top module)\s+[^\s:]+\s*:\s*([\d.]+)", full_stdout):
+        metrics["chip_area"] = float(item.group(1))
+    m = re.search(r"Estimated number of transistors:\s+(\d+)", full_stdout)
+    if m:
+        metrics["estimated_transistors"] = int(m.group(1))
+    return {"success": success, "stdout": full_stdout[-8000:], "stderr": full_stderr[-4000:], "full_log": full_stdout, "metrics": metrics, "elapsed_s": round(elapsed, 2), "result_files": collect_files(results_dir, reports_dir), "script_path": script_path, "log_file": log_file, "run_dir": run_dir, "remote": True, "host": os.uname().nodename, "tool": "yosys"}
+
+
+def run_klayout(payload):
+    run_label = payload["run_label"]
+    timeout_seconds = int(payload["timeout_seconds"])
+    design_name = payload["design_name"]
+    run_dir = run_dir_for(payload.get("session_name"), run_label)
+    os.makedirs(run_dir, exist_ok=True)
+    results_dir = os.path.join(run_dir, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    out_gds = os.path.join(results_dir, f"{design_name}_final.gds")
+    in_files_str = " ".join(payload.get("gds_files") or [])
+    layer_map = payload.get("gds_layer_map", "")
+    shell_cmd = "export QT_QPA_PLATFORM=offscreen && "
+    if payload.get("gds_allow_empty"):
+        shell_cmd += f'export GDS_ALLOW_EMPTY="{payload["gds_allow_empty"]}" && '
+    shell_cmd += (
+        f'klayout -zz -rd design_name={design_name} -rd in_def={payload["def_file"]} '
+        f'-rd "in_files={in_files_str}" -rd tech_file={payload["klayout_tech_file"]} '
+        f'-rd "layer_map={layer_map}" -rd seal_file= '
+        f'-rd out_file={out_gds} -r /mnt/shared/def2stream.py'
+    )
+    t0 = time.time()
+    try:
+        proc = subprocess.run(["bash", "-c", shell_cmd], capture_output=True, text=True, timeout=timeout_seconds)
+        elapsed = time.time() - t0
+        full_stdout = proc.stdout
+        full_stderr = proc.stderr
+        success = proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return {"success": False, "stdout": "", "stderr": f"KLayout timeout after {timeout_seconds}s", "metrics": {}, "elapsed_s": round(elapsed, 2), "gds_file": "", "result_files": [], "run_dir": run_dir, "remote": True, "host": os.uname().nodename, "tool": "klayout"}
+    log_file = os.path.join(run_dir, f"{run_label}.log")
+    with open(log_file, "w") as f:
+        f.write(full_stdout)
+    if full_stderr:
+        with open(os.path.join(run_dir, f"{run_label}.stderr.log"), "w") as f:
+            f.write(full_stderr)
+    gds_exists = os.path.isfile(out_gds)
+    metrics = {"klayout_errors": len(re.findall(r"\[ERROR\]", full_stdout)), "klayout_warnings": len(re.findall(r"\[WARNING\]", full_stdout)), "klayout_info_msgs": len(re.findall(r"\[INFO\]", full_stdout)), "all_cells_matched": "All LEF cells have matching GDS/OAS cells" in full_stdout, "no_orphan_cells": "No orphan cells in the final layout" in full_stdout}
+    if gds_exists:
+        size = os.path.getsize(out_gds); metrics["gds_file_size_bytes"] = size; metrics["gds_file_size_mb"] = round(size / (1024 * 1024), 2)
+    return {"success": success and gds_exists, "stdout": full_stdout[-8000:], "stderr": full_stderr[-4000:], "full_log": full_stdout, "metrics": metrics, "elapsed_s": round(elapsed, 2), "gds_file": out_gds if gds_exists else "", "result_files": collect_files(results_dir), "log_file": log_file, "run_dir": run_dir, "remote": True, "host": os.uname().nodename, "tool": "klayout"}
+
+
+def read_log(payload):
+    try:
+        with open(payload["path"]) as f:
+            lines = f.readlines()
+        return {"success": True, "content": "".join(lines[-int(payload["tail_lines"]):])}
+    except FileNotFoundError:
+        return {"success": False, "content": f"File not found on cluster: {payload['path']}"}
+    except Exception as exc:
+        return {"success": False, "content": f"Error reading remote log: {exc}"}
+
+
+def list_dir(payload):
+    skip = set(payload.get("skip_dirs") or [])
+    base = payload["dir_path"]
+    found = []
+    sizes = {}
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for filename in files:
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, base)
+            found.append(rel_path)
+            try:
+                sizes[rel_path] = os.path.getsize(abs_path)
+            except OSError:
+                sizes[rel_path] = None
+    return {"success": True, "files": found, "sizes": sizes}
+
+
+def read_files(payload):
+    base = payload["base_dir"]
+    files = {}
+    for rel in payload.get("files") or []:
+        try:
+            with open(os.path.join(base, rel), "rb") as f:
+                files[rel] = base64.b64encode(f.read()).decode("ascii")
+        except Exception:
+            files[rel] = None
+    return {"success": True, "files": files}
+
+
+def read_file_chunk(payload):
+    path = os.path.join(payload["base_dir"], payload["file"])
+    offset = int(payload.get("offset") or 0)
+    max_bytes = int(payload.get("max_bytes") or 524288)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(max_bytes)
+        next_byte = f.read(1)
     return {
-        "success": success,
-        "stdout": stdout,
-        "stderr": stderr,
-        "full_log": full_stdout,
-        "metrics": metrics,
-        "elapsed_s": round(elapsed, 2),
-        "result_files": result_files,
-        "tcl_path": tcl_path,
-        "log_file": log_file,
-        "run_dir": run_dir,
-        "remote": True,
-        "host": _os.uname().nodename,
+        "success": True,
+        "content_b64": base64.b64encode(data).decode("ascii"),
+        "next_offset": offset + len(data),
+        "eof": not next_byte,
     }
+
+
+def write_file(payload):
+    path = payload["path"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(payload["content_b64"]))
+    return {"success": True}
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        request = json.load(f)
+    kind = request["kind"]
+    payload = request["payload"]
+    handlers = {
+        "openroad": run_openroad,
+        "yosys": run_yosys,
+        "klayout": run_klayout,
+        "read_log": read_log,
+        "list_dir": list_dir,
+        "read_files": read_files,
+        "read_file_chunk": read_file_chunk,
+        "write_file": write_file,
+    }
+    try:
+        result = handlers[kind](payload)
+    except Exception as exc:
+        result = {"success": False, "stdout": "", "stderr": f"Ray job runner error: {type(exc).__name__}: {exc}", "metrics": {}, "elapsed_s": 0, "result_files": [], "run_dir": "", "remote": True, "host": os.uname().nodename}
+    emit(result)
+
+
+if __name__ == "__main__":
+    main()
+'''
 
 
 # ── Public synchronous API (called from LangChain tools) ──────────────
@@ -307,39 +484,24 @@ def run_openroad_on_ray(
     Returns:
         A dict identical in structure to the local runner's JSON response.
     """
-    _ensure_ray(ray_address)
-
-    ref = _run_openroad_remote.remote(
-        tcl_script, run_label, timeout_seconds, source_files, session_name
-    )
-
-    # Wait with a generous local-side timeout (network + scheduling + run)
-    local_timeout = timeout_seconds + 120
     try:
-        result = ray.get(ref, timeout=local_timeout)
-    except ray.exceptions.GetTimeoutError:
-        ray.cancel(ref, force=True)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": (
-                f"Ray task did not complete within {local_timeout}s "
-                f"(remote timeout: {timeout_seconds}s)"
-            ),
-            "metrics": {},
-            "elapsed_s": local_timeout,
-            "result_files": [],
-            "tcl_path": "",
-            "log_file": "",
-            "run_dir": "",
-            "remote": True,
-            "host": "",
-        }
+        return _run_job_payload(
+            ray_address,
+            "openroad",
+            {
+                "tcl_script": tcl_script,
+                "run_label": run_label,
+                "timeout_seconds": timeout_seconds,
+                "source_files": source_files,
+                "session_name": session_name,
+            },
+            timeout_seconds + 120,
+        )
     except Exception as exc:
         return {
             "success": False,
             "stdout": "",
-            "stderr": f"Ray execution error: {type(exc).__name__}: {exc}",
+            "stderr": f"Ray Job Submission error: {type(exc).__name__}: {exc}",
             "metrics": {},
             "elapsed_s": 0,
             "result_files": [],
@@ -349,158 +511,6 @@ def run_openroad_on_ray(
             "remote": True,
             "host": "",
         }
-
-    return result
-
-
-# ── Yosys remote task ──────────────────────────────────────────────────
-
-@ray.remote
-def _run_yosys_remote(
-    synth_script: str,
-    run_label: str,
-    timeout_seconds: int,
-    source_files: dict | None = None,
-    session_name: str | None = None,
-) -> dict:
-    """Execute a Yosys synthesis script on the remote cluster node.
-
-    Steps:
-        1. Create run directory under /mnt/shared/sessions/<session>/<run_label>/
-           (or /mnt/shared/openroad_work/<run_label>/ if no session).
-        2. Write the Yosys script to disk.
-        3. Execute:  bash -c 'source env.sh && yosys -c <script>'
-        4. Collect stdout, stderr, result files, metrics.
-        5. Return everything as a dict.
-    """
-    import json as _json
-    import os as _os
-    import re as _re
-    import subprocess as _sp
-    import time as _time
-
-    # env_script = "/home/ray/OpenROAD-flow-scripts/env.sh"
-    test_dir = "/mnt/shared/OpenROAD/test"
-    work_base = "/mnt/shared/openroad_work"
-    session_base_root = "/mnt/shared/sessions"
-
-    if session_name:
-        session_base = _os.path.join(session_base_root, session_name)
-        run_dir = _os.path.join(session_base, run_label)
-    else:
-        run_dir = _os.path.join(work_base, run_label)
-    _os.makedirs(run_dir, exist_ok=True)
-
-    reports_dir = _os.path.join(run_dir, "reports")
-    _os.makedirs(reports_dir, exist_ok=True)
-
-    results_dir = _os.path.join(run_dir, "results")
-    _os.makedirs(results_dir, exist_ok=True)
-
-    # Write uploaded source files to a src/ subdir
-    src_dir = _os.path.join(run_dir, "src")
-    if source_files:
-        _os.makedirs(src_dir, exist_ok=True)
-        for fname, content in source_files.items():
-            with open(_os.path.join(src_dir, fname), "w") as f:
-                f.write(content)
-
-    # Substitute path placeholders in the script
-    synth_script = synth_script.replace("__REPORTS_DIR__", reports_dir)
-    synth_script = synth_script.replace("__RESULTS_DIR__", results_dir)
-    synth_script = synth_script.replace("__SRC_DIR__", src_dir)
-
-    script_path = _os.path.join(run_dir, f"{run_label}.ys")
-    with open(script_path, "w") as f:
-        f.write(synth_script)
-
-    shell_cmd = (
-        # f'source {env_script} && '
-        f'/home/ray/oss-cad-suite/bin/yosys -c {script_path}'
-    )
-
-    t0 = _time.time()
-    try:
-        proc = _sp.run(
-            ["bash", "-c", shell_cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=test_dir,
-        )
-        elapsed = _time.time() - t0
-        success = proc.returncode == 0
-        full_stdout = proc.stdout
-        full_stderr = proc.stderr
-    except _sp.TimeoutExpired:
-        elapsed = _time.time() - t0
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Yosys timeout after {timeout_seconds}s",
-            "metrics": {},
-            "elapsed_s": round(elapsed, 2),
-            "result_files": [],
-            "script_path": script_path,
-            "log_file": "",
-            "run_dir": run_dir,
-            "remote": True,
-            "host": _os.uname().nodename,
-            "tool": "yosys",
-        }
-
-    # Persist logs
-    log_file = _os.path.join(run_dir, f"{run_label}.log")
-    with open(log_file, "w") as lf:
-        lf.write(full_stdout)
-    if full_stderr:
-        stderr_log = _os.path.join(run_dir, f"{run_label}.stderr.log")
-        with open(stderr_log, "w") as lf:
-            lf.write(full_stderr)
-
-    # Truncate for JSON
-    stdout = full_stdout[-8000:] if len(full_stdout) > 8000 else full_stdout
-    stderr = full_stderr[-4000:] if len(full_stderr) > 4000 else full_stderr
-
-    # Collect result files
-    result_files: list[str] = []
-    for d in [results_dir, reports_dir]:
-        if _os.path.isdir(d):
-            for fname in _os.listdir(d):
-                result_files.append(_os.path.join(d, fname))
-
-    # Parse metrics
-    metrics: dict = {}
-    m = _re.search(r'Number of cells:\s+(\d+)', full_stdout)
-    if m:
-        metrics["num_cells"] = int(m.group(1))
-    m = _re.search(r'Number of wires:\s+(\d+)', full_stdout)
-    if m:
-        metrics["num_wires"] = int(m.group(1))
-    for m_iter in _re.finditer(
-        r'Chip area for (?:module|top module)\s+[^\s:]+\s*:\s*([\d.]+)',
-        full_stdout,
-    ):
-        metrics["chip_area"] = float(m_iter.group(1))
-    m = _re.search(r'Estimated number of transistors:\s+(\d+)', full_stdout)
-    if m:
-        metrics["estimated_transistors"] = int(m.group(1))
-
-    return {
-        "success": success,
-        "stdout": stdout,
-        "stderr": stderr,
-        "full_log": full_stdout,
-        "metrics": metrics,
-        "elapsed_s": round(elapsed, 2),
-        "result_files": result_files,
-        "script_path": script_path,
-        "log_file": log_file,
-        "run_dir": run_dir,
-        "remote": True,
-        "host": _os.uname().nodename,
-        "tool": "yosys",
-    }
 
 
 def run_yosys_on_ray(
@@ -524,36 +534,24 @@ def run_yosys_on_ray(
     Returns:
         Dict with success, stdout, stderr, metrics, result_files, etc.
     """
-    _ensure_ray(ray_address)
-
-    ref = _run_yosys_remote.remote(
-        synth_script, run_label, timeout_seconds, source_files, session_name
-    )
-
-    local_timeout = timeout_seconds + 120
     try:
-        result = ray.get(ref, timeout=local_timeout)
-    except ray.exceptions.GetTimeoutError:
-        ray.cancel(ref, force=True)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Ray Yosys task did not complete within {local_timeout}s",
-            "metrics": {},
-            "elapsed_s": local_timeout,
-            "result_files": [],
-            "script_path": "",
-            "log_file": "",
-            "run_dir": "",
-            "remote": True,
-            "host": "",
-            "tool": "yosys",
-        }
+        return _run_job_payload(
+            ray_address,
+            "yosys",
+            {
+                "synth_script": synth_script,
+                "run_label": run_label,
+                "timeout_seconds": timeout_seconds,
+                "source_files": source_files,
+                "session_name": session_name,
+            },
+            timeout_seconds + 120,
+        )
     except Exception as exc:
         return {
             "success": False,
             "stdout": "",
-            "stderr": f"Ray Yosys error: {type(exc).__name__}: {exc}",
+            "stderr": f"Ray Job Submission Yosys error: {type(exc).__name__}: {exc}",
             "metrics": {},
             "elapsed_s": 0,
             "result_files": [],
@@ -565,21 +563,8 @@ def run_yosys_on_ray(
             "tool": "yosys",
         }
 
-    return result
-
 
 # ── Utility: fetch a remote log back to local ─────────────────────────
-
-@ray.remote(num_cpus=0)
-def _read_remote_file(path: str, tail_lines: int) -> str:
-    """Read a file on the cluster and return its last N lines."""
-    try:
-        with open(path) as f:
-            lines = f.readlines()
-        return "".join(lines[-tail_lines:])
-    except FileNotFoundError:
-        return f"File not found on cluster: {path}"
-
 
 def read_remote_log(
     log_path: str,
@@ -596,10 +581,14 @@ def read_remote_log(
     Returns:
         The last *tail_lines* lines of the file.
     """
-    _ensure_ray(ray_address)
-    ref = _read_remote_file.remote(log_path, tail_lines)
     try:
-        return ray.get(ref, timeout=30)
+        result = _run_job_payload(
+            ray_address,
+            "read_log",
+            {"path": log_path, "tail_lines": tail_lines},
+            60,
+        )
+        return result.get("content") or result.get("stderr") or ""
     except Exception as exc:
         return f"Error reading remote log: {exc}"
 
@@ -607,50 +596,6 @@ def read_remote_log(
 # ── Remote ↔ Local sync utilities ─────────────────────────────────────
 
 _REMOTE_SESSION_ROOT = "/mnt/shared/sessions"
-
-
-@ray.remote(num_cpus=0)
-def _list_remote_dir(dir_path: str, skip_dirs: list | None = None) -> list:
-    """Recursively list files under *dir_path* on the remote cluster.
-
-    Returns a list of relative paths (relative to *dir_path*).
-    Skips sub-directories whose basenames are in *skip_dirs*.
-    """
-    import os as _os
-
-    skip = set(skip_dirs or [])
-    found: list[str] = []
-    for root, dirs, files in _os.walk(dir_path):
-        # In-place filter dirs to skip
-        dirs[:] = [d for d in dirs if d not in skip]
-        for fn in files:
-            abs_path = _os.path.join(root, fn)
-            rel_path = _os.path.relpath(abs_path, dir_path)
-            found.append(rel_path)
-    return found
-
-
-@ray.remote(num_cpus=0)
-def _read_remote_file_bytes(path: str) -> bytes | None:
-    """Read a file on the cluster and return its bytes."""
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-@ray.remote(num_cpus=0)
-def _write_remote_file(path: str, content: bytes) -> bool:
-    """Write bytes to a file on the remote cluster (for pushing metadata)."""
-    import os as _os
-    try:
-        _os.makedirs(_os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(content)
-        return True
-    except Exception:
-        return False
 
 
 def sync_remote_run_to_local(
@@ -675,16 +620,41 @@ def sync_remote_run_to_local(
     """
     if not remote_run_dir:
         return []
-    _ensure_ray(ray_address)
+    return _sync_remote_run_to_local_connected(
+        remote_run_dir,
+        local_run_dir,
+        ray_address,
+        skip_dirs,
+    )
+
+
+def _sync_remote_run_to_local_connected(
+    remote_run_dir: str,
+    local_run_dir: str,
+    ray_address: str,
+    skip_dirs: list | None = None,
+) -> list[str]:
+    """Pull remote files through Ray Job Submission API."""
 
     if skip_dirs is None:
         skip_dirs = ["upload", "src"]   # we already have these locally
 
     # 1. List remote files
     try:
-        remote_files = ray.get(
-            _list_remote_dir.remote(remote_run_dir, skip_dirs), timeout=30
+        listed = _run_job_payload(
+            ray_address,
+            "list_dir",
+            {"dir_path": remote_run_dir, "skip_dirs": skip_dirs},
+            120,
         )
+        if not listed.get("success"):
+            logger.warning(
+                "Could not list remote dir %s: %s",
+                remote_run_dir,
+                listed.get("stderr") or listed.get("content") or listed,
+            )
+            return []
+        remote_files = listed.get("files") or []
     except Exception as exc:
         logger.warning("Could not list remote dir %s: %s", remote_run_dir, exc)
         return []
@@ -702,26 +672,42 @@ def sync_remote_run_to_local(
     if not to_fetch:
         return []
 
-    # 3. Fetch missing files in parallel via Ray
-    refs = {
-        rel: _read_remote_file_bytes.remote(
-            os.path.join(remote_run_dir, rel)
-        )
-        for rel in to_fetch
-    }
-
+    # 3. Fetch missing files in chunks. Job logs carry the marker JSON, so avoid
+    # returning large GDS/result files as one oversized log line.
     synced: list[str] = []
-    for rel, ref in refs.items():
+    chunk_bytes = max(4096, _env_int("OPENROAD_RAY_SYNC_CHUNK_BYTES", 524288))
+    for rel in to_fetch:
+        local_path = os.path.join(local_run_dir, rel)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        offset = 0
         try:
-            data = ray.get(ref, timeout=60)
-            if data is not None:
-                local_path = os.path.join(local_run_dir, rel)
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, "wb") as f:
-                    f.write(data)
-                synced.append(rel)
+            with open(local_path, "wb") as f:
+                while True:
+                    result = _run_job_payload(
+                        ray_address,
+                        "read_file_chunk",
+                        {
+                            "base_dir": remote_run_dir,
+                            "file": rel,
+                            "offset": offset,
+                            "max_bytes": chunk_bytes,
+                        },
+                        120,
+                    )
+                    if not result.get("success"):
+                        raise RuntimeError(result.get("stderr") or result)
+                    encoded = result.get("content_b64") or ""
+                    f.write(base64.b64decode(encoded))
+                    offset = int(result.get("next_offset") or offset)
+                    if result.get("eof"):
+                        break
+            synced.append(rel)
         except Exception as exc:
             logger.warning("Failed to fetch %s: %s", rel, exc)
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
     logger.info(
         "Synced %d/%d files from remote → local (%s)",
@@ -750,11 +736,19 @@ def push_file_to_remote(
     """
     if not os.path.isfile(local_path):
         return False
-    _ensure_ray(ray_address)
-    with open(local_path, "rb") as f:
-        data = f.read()
     try:
-        return ray.get(_write_remote_file.remote(remote_path, data), timeout=30)
+        with open(local_path, "rb") as f:
+            data = f.read()
+        result = _run_job_payload(
+            ray_address,
+            "write_file",
+            {
+                "path": remote_path,
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            },
+            120,
+        )
+        return bool(result.get("success"))
     except Exception as exc:
         logger.warning("Failed to push %s → %s: %s", local_path, remote_path, exc)
         return False
@@ -776,169 +770,6 @@ def push_session_meta_to_remote(
         if os.path.isfile(local):
             remote = os.path.join(remote_session, fname)
             push_file_to_remote(local, remote, ray_address)
-
-
-# ── KLayout remote task (DEF → GDS) ───────────────────────────────────
-
-@ray.remote
-def _run_klayout_remote(
-    def_file: str,
-    design_name: str,
-    gds_files: list[str],
-    klayout_tech_file: str,
-    gds_layer_map: str,
-    gds_allow_empty: str,
-    run_label: str,
-    timeout_seconds: int,
-    session_name: str | None = None,
-) -> dict:
-    """Execute KLayout GDS merging on the remote cluster node.
-
-    Uses the ORFS ``def2stream.py`` script to:
-        1. Read the routed DEF via KLayout's LEF/DEF reader.
-        2. Merge with GDS cell libraries.
-        3. Write the final GDSII file.
-
-    The DEF file is expected to already reside on the cluster filesystem
-    (produced by a prior OpenROAD P&R run).
-    """
-    import json as _json
-    import os as _os
-    import subprocess as _sp
-    import time as _time
-
-    # env_script = "/home/ray/OpenROAD-flow-scripts/env.sh"
-    def2stream = "/mnt/shared/def2stream.py"
-    work_base = "/mnt/shared/openroad_work"
-    session_base_root = "/mnt/shared/sessions"
-
-    if session_name:
-        session_base = _os.path.join(session_base_root, session_name)
-        run_dir = _os.path.join(session_base, run_label)
-    else:
-        run_dir = _os.path.join(work_base, run_label)
-    _os.makedirs(run_dir, exist_ok=True)
-
-    results_dir = _os.path.join(run_dir, "results")
-    _os.makedirs(results_dir, exist_ok=True)
-
-    out_gds = _os.path.join(results_dir, f"{design_name}_final.gds")
-    in_files_str = " ".join(gds_files)
-
-    # Build the KLayout shell command
-    #   source env.sh → sets PATH (though klayout may be system-installed)
-    #   QT_QPA_PLATFORM=offscreen → headless operation
-    #   klayout -zz → batch mode, no GUI
-    #   -rd key=value → pass variables to the script
-    #   -r def2stream.py → run the GDS merge script
-    shell_cmd = (
-        # f'source {env_script} && '
-        f'export QT_QPA_PLATFORM=offscreen && '
-    )
-    if gds_allow_empty:
-        shell_cmd += f'export GDS_ALLOW_EMPTY="{gds_allow_empty}" && '
-
-    shell_cmd += (
-        f'klayout -zz '
-        f'-rd design_name={design_name} '
-        f'-rd in_def={def_file} '
-        f'-rd "in_files={in_files_str}" '
-        f'-rd tech_file={klayout_tech_file} '
-        f'-rd "layer_map={gds_layer_map}" '
-        f'-rd seal_file= '
-        f'-rd out_file={out_gds} '
-        f'-r {def2stream}'
-    )
-
-    t0 = _time.time()
-    try:
-        proc = _sp.run(
-            ["bash", "-c", shell_cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        elapsed = _time.time() - t0
-        success = proc.returncode == 0
-        full_stdout = proc.stdout
-        full_stderr = proc.stderr
-    except _sp.TimeoutExpired:
-        elapsed = _time.time() - t0
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"KLayout timeout after {timeout_seconds}s",
-            "metrics": {},
-            "elapsed_s": round(elapsed, 2),
-            "gds_file": "",
-            "result_files": [],
-            "run_dir": run_dir,
-            "remote": True,
-            "host": _os.uname().nodename,
-            "tool": "klayout",
-        }
-
-    # Persist logs
-    log_file = _os.path.join(run_dir, f"{run_label}.log")
-    with open(log_file, "w") as lf:
-        lf.write(full_stdout)
-    if full_stderr:
-        stderr_log = _os.path.join(run_dir, f"{run_label}.stderr.log")
-        with open(stderr_log, "w") as lf:
-            lf.write(full_stderr)
-
-    # Truncate for JSON
-    stdout = full_stdout[-8000:] if len(full_stdout) > 8000 else full_stdout
-    stderr = full_stderr[-4000:] if len(full_stderr) > 4000 else full_stderr
-
-    # Collect result files
-    result_files: list[str] = []
-    if _os.path.isdir(results_dir):
-        for fname in _os.listdir(results_dir):
-            result_files.append(_os.path.join(results_dir, fname))
-
-    # Check if GDS was actually produced
-    gds_exists = _os.path.isfile(out_gds)
-    gds_size = _os.path.getsize(out_gds) if gds_exists else 0
-
-    # Parse KLayout messages for metrics
-    metrics: dict = {}
-    if gds_exists:
-        metrics["gds_file_size_bytes"] = gds_size
-        metrics["gds_file_size_mb"] = round(gds_size / (1024 * 1024), 2)
-
-    # Count errors / warnings from def2stream.py output
-    import re as _re
-    errors = len(_re.findall(r'\[ERROR\]', full_stdout))
-    warnings = len(_re.findall(r'\[WARNING\]', full_stdout))
-    infos = len(_re.findall(r'\[INFO\]', full_stdout))
-    metrics["klayout_errors"] = errors
-    metrics["klayout_warnings"] = warnings
-    metrics["klayout_info_msgs"] = infos
-
-    # Check for "All LEF cells have matching GDS" message
-    metrics["all_cells_matched"] = (
-        "All LEF cells have matching GDS/OAS cells" in full_stdout
-    )
-    metrics["no_orphan_cells"] = (
-        "No orphan cells in the final layout" in full_stdout
-    )
-
-    return {
-        "success": success and gds_exists,
-        "stdout": stdout,
-        "stderr": stderr,
-        "full_log": full_stdout,
-        "metrics": metrics,
-        "elapsed_s": round(elapsed, 2),
-        "gds_file": out_gds if gds_exists else "",
-        "result_files": result_files,
-        "log_file": log_file,
-        "run_dir": run_dir,
-        "remote": True,
-        "host": _os.uname().nodename,
-        "tool": "klayout",
-    }
 
 
 def run_klayout_on_ray(
@@ -970,37 +801,28 @@ def run_klayout_on_ray(
     Returns:
         Dict with success, stdout, stderr, metrics, gds_file, etc.
     """
-    _ensure_ray(ray_address)
-
-    ref = _run_klayout_remote.remote(
-        def_file, design_name, gds_files, klayout_tech_file,
-        gds_layer_map, gds_allow_empty, run_label, timeout_seconds,
-        session_name,
-    )
-
-    local_timeout = timeout_seconds + 120
     try:
-        result = ray.get(ref, timeout=local_timeout)
-    except ray.exceptions.GetTimeoutError:
-        ray.cancel(ref, force=True)
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Ray KLayout task did not complete within {local_timeout}s",
-            "metrics": {},
-            "elapsed_s": local_timeout,
-            "gds_file": "",
-            "result_files": [],
-            "run_dir": "",
-            "remote": True,
-            "host": "",
-            "tool": "klayout",
-        }
+        return _run_job_payload(
+            ray_address,
+            "klayout",
+            {
+                "def_file": def_file,
+                "design_name": design_name,
+                "gds_files": gds_files,
+                "klayout_tech_file": klayout_tech_file,
+                "gds_layer_map": gds_layer_map,
+                "gds_allow_empty": gds_allow_empty,
+                "run_label": run_label,
+                "timeout_seconds": timeout_seconds,
+                "session_name": session_name,
+            },
+            timeout_seconds + 120,
+        )
     except Exception as exc:
         return {
             "success": False,
             "stdout": "",
-            "stderr": f"Ray KLayout error: {type(exc).__name__}: {exc}",
+            "stderr": f"Ray Job Submission KLayout error: {type(exc).__name__}: {exc}",
             "metrics": {},
             "elapsed_s": 0,
             "gds_file": "",
@@ -1010,5 +832,3 @@ def run_klayout_on_ray(
             "host": "",
             "tool": "klayout",
         }
-
-    return result

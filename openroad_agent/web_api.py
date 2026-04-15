@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from openroad_agent.agents.orchestrator import _extract_subagent_result, set_stream_callback
 from openroad_agent.auth import AuthStore, AuthUser, COOKIE_NAME, TOKEN_MAX_AGE_SECONDS
+from openroad_agent.checkpoint import get_sqlite_checkpointer
 from openroad_agent.config import OpenROADConfig
 from openroad_agent.tools.artifacts import (
     build_artifact_zip,
@@ -37,6 +38,20 @@ STATIC_VERSION = max(
 )
 MAX_ATTACHMENT_BYTES = 240_000
 MAX_ATTACHMENT_CONTEXT_CHARS = 360_000
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip().strip("\"'")
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"WARNING: {name} must be an integer, got {raw!r}; using {default}.")
+        return default
+
+
+CHAT_JOB_TIMEOUT_SECONDS = _env_int("CHIPPILOT_CHAT_JOB_TIMEOUT_SECONDS", 600)
+CHAT_LONG_JOB_TIMEOUT_SECONDS = _env_int("CHIPPILOT_LONG_JOB_TIMEOUT_SECONDS", 10_800)
+CHAT_JOB_QUEUE_TIMEOUT_SECONDS = _env_int("CHIPPILOT_CHAT_QUEUE_TIMEOUT_SECONDS", 120)
 CHIP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="12" fill="#0f766e"/>
   <g fill="#f8f6f1">
@@ -129,9 +144,10 @@ class AppState:
     def __init__(self) -> None:
         self.config = OpenROADConfig()
         self.auth_store = AuthStore(self.config.work_dir)
-        self.chat_locks: dict[str, asyncio.Lock] = {}
+        self.chat_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.agent_cache: dict[tuple[str, str], Any] = {}
         self.thread_ids: dict[tuple[str, str], str] = {}
+        self.job_queues: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
 
 
 state = AppState()
@@ -141,6 +157,10 @@ def _auth_store() -> AuthStore:
     if state.auth_store.work_dir != Path(state.config.work_dir):
         state.auth_store = AuthStore(state.config.work_dir)
     return state.auth_store
+
+
+def _store():
+    return _auth_store().store
 
 
 def _normalize_content(content: Any) -> str:
@@ -268,20 +288,20 @@ def _require_user(request: Request) -> AuthUser:
     return user
 
 
-def _chat_lock_for(user: AuthUser) -> asyncio.Lock:
-    lock = state.chat_locks.get(user.user_id)
+def _chat_lock_for(user: AuthUser, session_name: str) -> asyncio.Lock:
+    key = (user.user_id, session_name)
+    lock = state.chat_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        state.chat_locks[user.user_id] = lock
+        state.chat_locks[key] = lock
     return lock
 
 
 def _resolve_session_name(session_name: str, user: AuthUser) -> str:
-    sessions_root = _sessions_root(user)
-    exact = sessions_root / session_name
-    if exact.is_dir():
+    if _store().get_session(user.user_id, session_name):
         return session_name
 
+    sessions_root = _sessions_root(user)
     prefix = _session_timestamp_prefix(session_name)
     current = SessionManager.get_current()
     if (
@@ -294,11 +314,11 @@ def _resolve_session_name(session_name: str, user: AuthUser) -> str:
         if current_path.is_dir():
             return current.session_name
 
-    if prefix and sessions_root.exists():
+    if prefix:
         matches = sorted(
-            path.name
-            for path in sessions_root.iterdir()
-            if path.is_dir() and _session_timestamp_prefix(path.name) == prefix
+            name
+            for name in _store().list_sessions(user.user_id)
+            if _session_timestamp_prefix(name) == prefix
         )
         if len(matches) == 1:
             return matches[0]
@@ -674,13 +694,7 @@ def _conversation_history(session_name: str, user: AuthUser) -> list[HumanMessag
 
 
 def _list_session_names(user: AuthUser) -> list[str]:
-    sessions_root = _sessions_root(user)
-    if not sessions_root.exists():
-        return []
-    return sorted(
-        [path.name for path in sessions_root.iterdir() if path.is_dir()],
-        reverse=True,
-    )
+    return _store().list_sessions(user.user_id)
 
 
 def _delete_session_dir(session_name: str, user: AuthUser) -> None:
@@ -698,8 +712,12 @@ def _delete_session_dir(session_name: str, user: AuthUser) -> None:
         SessionManager.clear()
 
     cache_key = (user.user_id, resolved_name)
+    thread_id = state.thread_ids.get(cache_key) or _store().get_thread_id(user.user_id, resolved_name)
     state.agent_cache.pop(cache_key, None)
     state.thread_ids.pop(cache_key, None)
+    if thread_id:
+        get_sqlite_checkpointer(state.config.work_dir).delete_thread(thread_id)
+    _store().mark_session_deleted(user.user_id, resolved_name)
     shutil.rmtree(target)
 
 
@@ -710,8 +728,24 @@ def _activate_session(user: AuthUser, session_name: str | None, name_hint: str =
         current = SessionManager.get_current()
         if current and current.session_name == session_name and Path(current.work_dir) == Path(work_dir):
             return current
-        return SessionManager.load_existing(work_dir, session_name)
-    return SessionManager.start_new(work_dir, name_hint=name_hint)
+        session = SessionManager.load_existing(work_dir, session_name)
+        _store().upsert_session(
+            user.user_id,
+            session.session_name,
+            session.base_dir,
+            name_hint=session.name_hint,
+            created_at=session.timestamp,
+        )
+        return session
+    session = SessionManager.start_new(work_dir, name_hint=name_hint)
+    _store().upsert_session(
+        user.user_id,
+        session.session_name,
+        session.base_dir,
+        name_hint=session.name_hint,
+        created_at=session.timestamp,
+    )
+    return session
 
 
 def _agent_for_session(user: AuthUser, session_name: str) -> tuple[Any, str, bool]:
@@ -721,8 +755,18 @@ def _agent_for_session(user: AuthUser, session_name: str) -> tuple[Any, str, boo
     if agent is None:
         agent = create_agent(config=state.config)
         state.agent_cache[cache_key] = agent
-        state.thread_ids[cache_key] = str(uuid.uuid4())
+        state.thread_ids[cache_key] = _store().get_or_create_thread_id(
+            user.user_id,
+            session_name,
+            str(uuid.uuid4()),
+        )
         created = True
+    elif cache_key not in state.thread_ids:
+        state.thread_ids[cache_key] = _store().get_or_create_thread_id(
+            user.user_id,
+            session_name,
+            str(uuid.uuid4()),
+        )
     return agent, state.thread_ids[cache_key], created
 
 
@@ -735,6 +779,8 @@ def _sync_agent_session_key(user: AuthUser, previous_name: str, current_name: st
         state.agent_cache[current_key] = state.agent_cache.pop(previous_key)
     if previous_key in state.thread_ids and current_key not in state.thread_ids:
         state.thread_ids[current_key] = state.thread_ids.pop(previous_key)
+    _store().move_thread(user.user_id, previous_name, current_name)
+    _store().rename_session(user.user_id, previous_name, current_name, _session_path(current_name, user))
 
 
 def _log_stream_event(session: SessionManager, msg: Any) -> None:
@@ -797,6 +843,254 @@ def _log_subagent_stream_event(session: SessionManager, event_type: str, agent_n
         )
 
 
+def _public_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": job["job_id"],
+        "session_name": job["session_name"],
+        "job_type": job.get("job_type", "chat"),
+        "timeout_seconds": job.get("timeout_seconds", CHAT_JOB_TIMEOUT_SECONDS),
+        "status": job["status"],
+        "message": job.get("message", ""),
+        "error": job.get("error", ""),
+        "result": job.get("result", {}),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "updated_at": job.get("updated_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _classify_chat_job(message: str, attachments: list[str]) -> tuple[str, int]:
+    text = message.lower()
+    long_patterns = [
+        "dse",
+        "explore",
+        "exploration",
+        "sweep",
+        "parameter",
+        "full flow",
+        "rtl-to-gds",
+        "openroad",
+        "yosys",
+        "klayout",
+        "run ",
+        "execute",
+        "synthesis",
+        "synthesize",
+        "placement",
+        "routing",
+        "floorplan",
+        "cts",
+        "gds",
+        "参数",
+        "探索",
+        "扫描",
+        "扫一遍",
+        "多组",
+        "完整流程",
+        "全流程",
+        "运行",
+        "执行",
+        "综合",
+        "布局",
+        "布线",
+        "物理设计",
+        "生成gds",
+    ]
+    if attachments or any(pattern in text for pattern in long_patterns):
+        return "long_running", CHAT_LONG_JOB_TIMEOUT_SECONDS
+    return "chat", CHAT_JOB_TIMEOUT_SECONDS
+
+
+def _emit_job_event(job_id: str, event: dict[str, Any]) -> None:
+    queues = state.job_queues.get(job_id, [])
+    for queue in list(queues):
+        queue.put_nowait(event)
+
+
+def _job_event_payload(event_type: str, job: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {
+        "type": event_type,
+        "job": _public_job(job),
+        "session_name": job["session_name"],
+        **extra,
+    }
+
+
+def _fail_chat_job(
+    job_id: str,
+    user: AuthUser,
+    session_name: str,
+    message: str,
+    error: str,
+) -> None:
+    _store().update_job(
+        job_id,
+        "failed",
+        message=message,
+        error=error,
+        result={"session_name": session_name},
+    )
+    failed_job = _store().get_job(user.user_id, job_id)
+    if failed_job:
+        _emit_job_event(job_id, _job_event_payload("failed", failed_job))
+
+
+async def _run_chat_job_locked(
+    job_id: str,
+    user: AuthUser,
+    session_name: str,
+    initial_session_name: str,
+    input_messages: list[HumanMessage | AIMessage],
+    agent: Any,
+    thread_id: str,
+) -> None:
+    job = _store().get_job(user.user_id, job_id)
+    if not job:
+        return
+
+    collected_messages = list(input_messages)
+    session = _activate_session(user, session_name)
+
+    def emit_session_update(event_type: str = "session") -> None:
+        current_job = _store().get_job(user.user_id, job_id) or job
+        _emit_job_event(
+            job_id,
+            _job_event_payload(
+                event_type,
+                current_job,
+                session_name=session.session_name,
+            ),
+        )
+
+    def on_subagent_event(event_type: str, agent_name: str, msg: Any) -> None:
+        _log_subagent_stream_event(session, event_type, agent_name, msg)
+        _sync_agent_session_key(user, initial_session_name, session.session_name)
+        emit_session_update("session")
+
+    set_stream_callback(on_subagent_event)
+    try:
+        async for event in agent.astream(
+            {"messages": input_messages},
+            config={"configurable": {"thread_id": thread_id}},
+            stream_mode="updates",
+        ):
+            for node_output in event.values():
+                for msg in node_output.get("messages", []):
+                    collected_messages.append(msg)
+                    _log_stream_event(session, msg)
+                    _sync_agent_session_key(user, initial_session_name, session.session_name)
+                    _store().touch_session(user.user_id, session.session_name)
+                    emit_session_update("session")
+    finally:
+        set_stream_callback(None)
+
+    assistant_reply = _extract_subagent_result({"messages": collected_messages})
+    session.log_message("assistant", assistant_reply)
+    _store().touch_session(user.user_id, session.session_name)
+    _sync_agent_session_key(user, initial_session_name, session.session_name)
+    _store().update_job(
+        job_id,
+        "completed",
+        message="Agent completed.",
+        result={
+            "session_name": session.session_name,
+            "assistant_reply": assistant_reply,
+        },
+    )
+    completed_job = _store().get_job(user.user_id, job_id) or job
+    _emit_job_event(job_id, _job_event_payload("completed", completed_job))
+
+
+async def _run_chat_job(
+    job_id: str,
+    user: AuthUser,
+    session_name: str,
+    initial_session_name: str,
+    input_messages: list[HumanMessage | AIMessage],
+    agent: Any,
+    thread_id: str,
+) -> None:
+    job = _store().get_job(user.user_id, job_id)
+    if not job:
+        return
+
+    lock = _chat_lock_for(user, session_name)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=CHAT_JOB_QUEUE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        _fail_chat_job(
+            job_id,
+            user,
+            session_name,
+            "Agent job timed out in queue.",
+            (
+                "Timed out waiting for this session to become available "
+                f"after {CHAT_JOB_QUEUE_TIMEOUT_SECONDS}s."
+            ),
+        )
+        return
+
+    try:
+        _store().update_job(job_id, "running", message="Agent is working.")
+        job = _store().get_job(user.user_id, job_id) or job
+        _emit_job_event(job_id, _job_event_payload("status", job))
+        timeout_seconds = int(job.get("timeout_seconds") or CHAT_JOB_TIMEOUT_SECONDS)
+        try:
+            await asyncio.wait_for(
+                _run_chat_job_locked(
+                    job_id,
+                    user,
+                    session_name,
+                    initial_session_name,
+                    input_messages,
+                    agent,
+                    thread_id,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            current = SessionManager.get_current()
+            current_name = (
+                current.session_name
+                if current and Path(current.work_dir) == _user_work_dir(user)
+                else session_name
+            )
+            if current and Path(current.work_dir) == _user_work_dir(user):
+                current.log_message(
+                    "error",
+                    f"Agent job timed out after {timeout_seconds}s.",
+                )
+                _store().touch_session(user.user_id, current.session_name)
+            _fail_chat_job(
+                job_id,
+                user,
+                current_name,
+                "Agent job timed out.",
+                f"Agent did not finish within {timeout_seconds}s.",
+            )
+        except Exception as exc:
+            current = SessionManager.get_current()
+            current_name = (
+                current.session_name
+                if current and Path(current.work_dir) == _user_work_dir(user)
+                else session_name
+            )
+            if current and Path(current.work_dir) == _user_work_dir(user):
+                current.log_message("error", str(exc))
+                _store().touch_session(user.user_id, current.session_name)
+                _sync_agent_session_key(user, initial_session_name, current.session_name)
+            _fail_chat_job(
+                job_id,
+                user,
+                current_name,
+                "Agent failed.",
+                f"{type(exc).__name__}: {exc}",
+            )
+    finally:
+        lock.release()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Chippilot Web UI")
     app.mount(
@@ -804,6 +1098,10 @@ def create_app() -> FastAPI:
         NoCacheStaticFiles(directory=str(STATIC_DIR), html=False, follow_symlink=False),
         name="static",
     )
+
+    @app.on_event("startup")
+    async def startup_recover_jobs() -> None:
+        _auth_store().ensure_initialized()
 
     @app.post("/api/auth/register")
     async def register(payload: AuthRequest, response: Response) -> dict[str, Any]:
@@ -1012,57 +1310,101 @@ def create_app() -> FastAPI:
         if not message and not attachments:
             raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-        async with _chat_lock_for(user):
-            session = _activate_session(user, payload.session_name, _sanitize_hint(message))
-            initial_session_name = session.session_name
-            model_message = _message_with_attachments(message, attachments, session)
-            history = _conversation_history(session.session_name, user)
-            agent, thread_id, created = _agent_for_session(user, session.session_name)
-            session.log_message(
-                "user",
-                message,
-                attachments=attachments,
-                agent_context=model_message if model_message != message else None,
+        session = _activate_session(user, payload.session_name, _sanitize_hint(message))
+        initial_session_name = session.session_name
+        model_message = _message_with_attachments(message, attachments, session)
+        history = _conversation_history(session.session_name, user)
+        agent, thread_id, created = _agent_for_session(user, session.session_name)
+        session.log_message(
+            "user",
+            message,
+            attachments=attachments,
+            agent_context=model_message if model_message != message else None,
+        )
+        _store().touch_session(user.user_id, session.session_name)
+
+        new_message = HumanMessage(content=model_message)
+        input_messages = [*history, new_message] if created else [new_message]
+        job_id = str(uuid.uuid4())
+        job_type, timeout_seconds = _classify_chat_job(message, attachments)
+        job = _store().create_job(
+            job_id,
+            user.user_id,
+            session.session_name,
+            message=(
+                "Long-running agent job queued."
+                if job_type == "long_running"
+                else "Agent queued."
+            ),
+            job_type=job_type,
+            timeout_seconds=timeout_seconds,
+        )
+
+        asyncio.create_task(
+            _run_chat_job(
+                job_id,
+                user,
+                session.session_name,
+                initial_session_name,
+                input_messages,
+                agent,
+                thread_id,
             )
+        )
 
-            new_message = HumanMessage(content=model_message)
-            input_messages = [*history, new_message] if created else [new_message]
-            collected_messages = list(input_messages)
+        return {
+            "job": _public_job(job),
+            "session": _build_session_detail(session.session_name, user),
+            "assistant_reply": "",
+        }
 
-            def on_subagent_event(event_type: str, agent_name: str, msg: Any) -> None:
-                _log_subagent_stream_event(session, event_type, agent_name, msg)
-                _sync_agent_session_key(user, initial_session_name, session.session_name)
+    @app.get("/api/jobs/{job_id}")
+    async def get_job(job_id: str, user: AuthUser = Depends(_require_user)) -> dict[str, Any]:
+        job = _store().get_job(user.user_id, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+        return {"job": _public_job(job)}
 
-            set_stream_callback(on_subagent_event)
+    @app.get("/api/jobs/{job_id}/events")
+    async def job_events(job_id: str, user: AuthUser = Depends(_require_user)) -> StreamingResponse:
+        job = _store().get_job(user.user_id, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+
+        async def stream():
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            state.job_queues.setdefault(job_id, []).append(queue)
             try:
-                async for event in agent.astream(
-                    {"messages": input_messages},
-                    config={"configurable": {"thread_id": thread_id}},
-                    stream_mode="updates",
-                ):
-                    for node_output in event.values():
-                        for msg in node_output.get("messages", []):
-                            collected_messages.append(msg)
-                            _log_stream_event(session, msg)
-                            _sync_agent_session_key(user, initial_session_name, session.session_name)
-            except Exception as exc:
-                session.log_message("error", str(exc))
-                _sync_agent_session_key(user, initial_session_name, session.session_name)
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"{type(exc).__name__}: {exc}",
-                ) from exc
+                initial = _store().get_job(user.user_id, job_id)
+                if initial:
+                    yield f"data: {json.dumps(_job_event_payload('status', initial), ensure_ascii=False)}\n\n"
+                    if initial["status"] in {"completed", "failed", "cancelled"}:
+                        return
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+                        continue
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    event_job = event.get("job", {})
+                    if event_job.get("status") in {"completed", "failed", "cancelled"}:
+                        return
             finally:
-                set_stream_callback(None)
+                queues = state.job_queues.get(job_id, [])
+                if queue in queues:
+                    queues.remove(queue)
+                if not queues:
+                    state.job_queues.pop(job_id, None)
 
-            assistant_reply = _extract_subagent_result({"messages": collected_messages})
-            session.log_message("assistant", assistant_reply)
-            _sync_agent_session_key(user, initial_session_name, session.session_name)
-
-            return {
-                "session": _build_session_detail(session.session_name, user),
-                "assistant_reply": assistant_reply,
-            }
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/")
     async def index() -> HTMLResponse:
