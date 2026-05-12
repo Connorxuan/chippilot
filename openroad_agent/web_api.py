@@ -21,7 +21,8 @@ from pydantic import BaseModel, Field
 from openroad_agent.agents.orchestrator import _extract_subagent_result, set_stream_callback
 from openroad_agent.auth import AuthStore, AuthUser, COOKIE_NAME, TOKEN_MAX_AGE_SECONDS
 from openroad_agent.checkpoint import get_sqlite_checkpointer
-from openroad_agent.config import OpenROADConfig
+from openroad_agent.config import OpenROADConfig, SUPPORTED_MODELS
+from openroad_agent.context_manager import ContextManager
 from openroad_agent.tools.artifacts import (
     build_artifact_zip,
     list_session_artifacts,
@@ -148,6 +149,9 @@ class AppState:
         self.agent_cache: dict[tuple[str, str], Any] = {}
         self.thread_ids: dict[tuple[str, str], str] = {}
         self.job_queues: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
+        self.context_manager = ContextManager(model_name=self.config.model_name)
+        self.current_model: str = self.config.model_name
+        self.model_lock = asyncio.Lock()
 
 
 state = AppState()
@@ -753,7 +757,7 @@ def _agent_for_session(user: AuthUser, session_name: str) -> tuple[Any, str, boo
     agent = state.agent_cache.get(cache_key)
     created = False
     if agent is None:
-        agent = create_agent(config=state.config)
+        agent = create_agent(model=state.current_model, config=state.config)
         state.agent_cache[cache_key] = agent
         state.thread_ids[cache_key] = _store().get_or_create_thread_id(
             user.user_id,
@@ -968,6 +972,15 @@ async def _run_chat_job_locked(
         _sync_agent_session_key(user, initial_session_name, session.session_name)
         emit_session_update("session")
 
+    # ── Context compaction: prevent unbounded growth in long sessions ──
+    checkpointer = get_sqlite_checkpointer(state.config.work_dir)
+    cfg_tuple = checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+    if cfg_tuple:
+        hist = cfg_tuple.checkpoint.get("channel_values", {}).get("messages", [])
+        if state.context_manager.should_compact(hist):
+            compacted = state.context_manager.compact(hist)
+            checkpointer.compact_thread(thread_id, compacted)
+
     set_stream_callback(on_subagent_event)
     try:
         async for event in agent.astream(
@@ -1150,12 +1163,47 @@ def create_app() -> FastAPI:
         sessions = [_build_session_summary(name, user) for name in _list_session_names(user)]
         return {
             "app_name": "Chippilot",
-            "model_name": state.config.model_name,
+            "model_name": state.current_model,
+            "supported_models": SUPPORTED_MODELS,
             "user": user.__dict__,
             "sessions": sessions,
             "starter_prompts": STARTER_PROMPTS,
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
+
+    @app.get("/api/config")
+    async def get_config(user: AuthUser = Depends(_require_user)) -> dict[str, Any]:
+        return {
+            "current_model": state.current_model,
+            "supported_models": SUPPORTED_MODELS,
+            "execution_mode": state.config.execution_mode,
+        }
+
+    class SwitchModelRequest(BaseModel):
+        model: str
+
+    @app.post("/api/config/model")
+    async def switch_model(
+        payload: SwitchModelRequest,
+        user: AuthUser = Depends(_require_user),
+    ) -> dict[str, Any]:
+        new_model = payload.model.strip()
+        if not new_model:
+            raise HTTPException(status_code=400, detail="Model name is required.")
+        if new_model not in SUPPORTED_MODELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model: {new_model}. Supported: {', '.join(SUPPORTED_MODELS)}",
+            )
+        async with state.model_lock:
+            if state.current_model != new_model:
+                state.current_model = new_model
+                state.config.model_name = new_model
+                state.context_manager = ContextManager(model_name=new_model)
+                # Invalidate agent cache so subsequent chats use the new model
+                state.agent_cache.clear()
+                state.thread_ids.clear()
+        return {"current_model": state.current_model}
 
     @app.get("/api/sessions")
     async def list_sessions(user: AuthUser = Depends(_require_user)) -> dict[str, Any]:

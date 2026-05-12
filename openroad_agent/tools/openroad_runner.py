@@ -326,7 +326,7 @@ exit
 
 
 @tool
-def read_openroad_log(log_path: str, tail_lines: int = 200) -> str:
+def read_openroad_log(log_path: str, tail_lines: int = 200, max_chars: int = 100_000) -> str:
     """Read the last N lines of an OpenROAD log or result file.
 
     Works for both local files and remote files on the Ray cluster.
@@ -335,6 +335,7 @@ def read_openroad_log(log_path: str, tail_lines: int = 200) -> str:
     Args:
         log_path: Path to the log file (relative to work_dir, or absolute).
         tail_lines: Number of lines from the end to return.
+        max_chars: Maximum characters to return (hard limit 500k).
 
     Returns:
         The tail of the log file content.
@@ -347,13 +348,29 @@ def read_openroad_log(log_path: str, tail_lines: int = 200) -> str:
     # If it's a remote cluster path and we're in ray mode, fetch via Ray
     if log_path.startswith("/mnt/shared/") and cfg.execution_mode == "ray":
         from openroad_agent.tools.ray_executor import read_remote_log
-        return read_remote_log(log_path, tail_lines, cfg.ray_address)
+        text = read_remote_log(log_path, tail_lines, cfg.ray_address)
+        hard_limit = 500_000
+        cap = min(max_chars, hard_limit)
+        if len(text) > cap:
+            text = text[-cap:] + (
+                f"\n\n[Log truncated after {cap} characters. "
+                "Use a smaller tail_lines or read a specific section.]"
+            )
+        return text
 
     # Local file
     try:
-        with open(log_path) as f:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
-        return "".join(lines[-tail_lines:])
+        text = "".join(lines[-tail_lines:])
+        hard_limit = 500_000
+        cap = min(max_chars, hard_limit)
+        if len(text) > cap:
+            text = text[-cap:] + (
+                f"\n\n[Log truncated after {cap} characters. "
+                "Use a smaller tail_lines or read a specific section.]"
+            )
+        return text
     except FileNotFoundError:
         return f"File not found: {log_path}"
 

@@ -7,6 +7,46 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# ── Known model providers for auto-prefix detection ────────────────────
+# Maps model-name prefix → LangChain provider string.
+# For models not listed here, use the full "provider:model" form directly.
+_PROVIDER_PREFIX_MAP: dict[str, str] = {
+    "gemini": "google_genai",
+    "gpt": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+    "claude": "anthropic",
+    "deepseek": "deepseek",
+    "llama": "fireworks",
+    "mixtral": "fireworks",
+    "mistral": "mistralai",
+    "command": "cohere",
+    "qwen": "alibaba",
+}
+
+# ── Models exposed in the web UI selector ──────────────────────────────
+SUPPORTED_MODELS = [
+    "deepseek:deepseek-v4-pro",
+    "google_genai:gemini-2.5-flash",
+    "google_genai:gemini-2.5-pro",
+]
+
+
+def _normalize_model_name(name: str) -> str:
+    """Ensure a model name has the correct LangChain provider prefix.
+
+    If the string already contains ``:`` or ``/``, it is returned as-is.
+    Otherwise we try to guess the provider from the model name prefix and
+    prepend ``provider:``.
+    """
+    if ":" in name or "/" in name:
+        return name
+    for prefix, provider in _PROVIDER_PREFIX_MAP.items():
+        if name.startswith(prefix):
+            return f"{provider}:{name}"
+    return name
+
 
 @dataclass
 class OpenROADConfig:
@@ -27,9 +67,9 @@ class OpenROADConfig:
     test_dir: str = ""  # populated in __post_init__
 
     # ── LLM ────────────────────────────────────────────────────────────
-    model_name: str = os.environ.get("OPENROAD_LLM_MODEL", "google_genai:gemini-2.5-flash")
+    model_name: str = os.environ.get("OPENROAD_LLM_MODEL", "deepseek:deepseek-v4-pro")
     temperature: float = float(os.environ.get("OPENROAD_LLM_TEMPERATURE", "0.1"))
-    api_key: str = os.environ.get("GOOGLE_API_KEY", "")
+    api_key: str = os.environ.get("DEEPSEEK_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
     # ── Supported PDKs & their variable files (relative to test_dir) ──
     supported_platforms: dict[str, str] = field(default_factory=lambda: {
@@ -60,14 +100,7 @@ class OpenROADConfig:
         self.test_dir = os.path.join(self.openroad_root, "test")
         os.makedirs(self.work_dir, exist_ok=True)
         # Ensure model_name has provider prefix for LangChain init_chat_model
-        if ":" not in self.model_name and "/" not in self.model_name:
-            # Bare model name like "gemini-2.5-flash" → add google_genai prefix
-            if self.model_name.startswith("gemini"):
-                self.model_name = f"google_genai:{self.model_name}"
-            elif self.model_name.startswith("gpt"):
-                self.model_name = f"openai:{self.model_name}"
-            elif self.model_name.startswith("claude"):
-                self.model_name = f"anthropic:{self.model_name}"
+        self.model_name = _normalize_model_name(self.model_name)
 
     def platform_vars_path(self, platform: str) -> str:
         """Return absolute path to the platform .vars file."""

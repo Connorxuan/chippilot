@@ -634,8 +634,7 @@ function EmptyState({ prompts, onPrompt }) {
   return (
     <div className="empty-state">
       <div className="empty-state-copy">
-        <span className="eyebrow">ChatGPT-inspired workflow shell</span>
-        <h2>What are we taping out today?</h2>
+        <h2>Let Chippilot boost your design.</h2>
         <p>
           Ask Chippilot to run OpenROAD flows, debug synthesis and routing issues,
           compare metrics, or plan the next optimization move.
@@ -751,7 +750,6 @@ function Composer({ draft, setDraft, onSend, onPickFiles, pendingAttachments, on
               {uploading ? "Uploading..." : "Attach files"}
             </button>
             <span>Shift + Enter for newline</span>
-            <span>OpenROAD-aware agent</span>
           </div>
           <button className="send-button" onClick={() => onSend()} disabled={busy || (!draft.trim() && !pendingAttachments.length)}>
             {busy ? "Thinking..." : "Send"}

@@ -57,6 +57,8 @@ from openroad_agent.tools.file_manager import (
     save_design_files,
     list_design_files,
     read_design_file,
+    read_file_chunk,
+    search_in_file,
 )
 from openroad_agent.tools.klayout_runner import (
     run_klayout_gds,
@@ -99,6 +101,8 @@ def _all_tools():
         save_design_files,
         list_design_files,
         read_design_file,
+        read_file_chunk,
+        search_in_file,
         # ── KLayout GDS generation ──
         run_klayout_gds,
         list_gds_platforms,
@@ -414,6 +418,8 @@ def create_orchestrator_agent(
                 list_supported_platforms,
                 read_design_tcl,
                 read_platform_vars,
+                read_file_chunk,
+                search_in_file,
                 generate_yosys_synth_script,
                 list_synth_platforms,
             ],

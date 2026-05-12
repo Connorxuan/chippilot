@@ -58,39 +58,55 @@ def list_available_designs() -> str:
     return json.dumps(designs, indent=2)
 
 
+def _safe_read(path: str, limit: int = 200_000) -> str:
+    """Read a text file with a hard size cap."""
+    hard_limit = 500_000
+    cap = min(limit, hard_limit)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(cap + 1)
+    except FileNotFoundError:
+        return f"File not found: {path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
+    if len(content) > cap:
+        content = content[:cap] + (
+            f"\n\n[File truncated after {cap} characters. "
+            "Use read_openroad_log with tail_lines to read a specific section.]"
+        )
+    return content
+
+
 @tool
-def read_design_tcl(design_tcl_path: str) -> str:
+def read_design_tcl(design_tcl_path: str, max_chars: int = 200_000) -> str:
     """Read and return the content of a design TCL file.
 
     Args:
         design_tcl_path: Path to the design .tcl file (relative to test/ or absolute).
+        max_chars: Maximum characters to return (default 200k, hard limit 500k).
 
     Returns:
         The TCL file content.
     """
     if not os.path.isabs(design_tcl_path):
         design_tcl_path = os.path.join(_get_cfg().test_dir, design_tcl_path)
-    try:
-        with open(design_tcl_path) as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"File not found: {design_tcl_path}"
+    return _safe_read(design_tcl_path, max_chars)
 
 
 @tool
-def read_platform_vars(platform: str) -> str:
+def read_platform_vars(platform: str, max_chars: int = 100_000) -> str:
     """Read platform variable definitions for a PDK.
 
     Args:
         platform: Platform name (e.g., "nangate45", "sky130hd").
+        max_chars: Maximum characters to return (default 100k, hard limit 500k).
 
     Returns:
         Contents of the .vars file.
     """
     try:
         path = _get_cfg().platform_vars_path(platform)
-        with open(path) as f:
-            return f.read()
+        return _safe_read(path, max_chars)
     except (ValueError, FileNotFoundError) as e:
         return str(e)
 

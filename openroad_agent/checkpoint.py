@@ -366,6 +366,61 @@ class SQLiteCheckpointSaver(BaseCheckpointSaver[str]):
             conn.execute("DELETE FROM langgraph_writes WHERE thread_id = ?", (thread_id,))
             conn.execute("DELETE FROM langgraph_blobs WHERE thread_id = ?", (thread_id,))
 
+    def compact_thread(
+        self,
+        thread_id: str,
+        new_messages: list[Any],
+    ) -> None:
+        """Rewrite a thread's history, replacing old messages with *new_messages*.
+
+        This creates a fresh checkpoint for the thread so that subsequent
+        LangGraph loads see only the compacted message list.
+
+        Args:
+            thread_id: The LangGraph thread to rewrite.
+            new_messages: The replacement message list (usually a summary
+                          SystemMessage + recent messages).
+        """
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        tuple_ = self.get_tuple(config)
+        if tuple_ is None:
+            return
+
+        checkpoint = dict(tuple_.checkpoint)
+        metadata = dict(tuple_.metadata) if tuple_.metadata else {}
+
+        # Replace messages channel
+        channel_values = checkpoint.setdefault("channel_values", {})
+        channel_values["messages"] = list(new_messages)
+
+        # New checkpoint id so LangGraph treats this as the latest version
+        old_id = checkpoint.get("id", "")
+        new_id = f"{old_id}_compact_{int(time.time() * 1000)}"
+        checkpoint["id"] = new_id
+
+        # Bump every channel version so blobs are re-written
+        current_versions = checkpoint.get("channel_versions", {})
+        new_versions: dict[str, str] = {}
+        for channel, version in current_versions.items():
+            new_versions[channel] = self.get_next_version(version, None)
+        if "messages" not in current_versions:
+            new_versions["messages"] = self.get_next_version(None, None)
+            checkpoint["channel_versions"] = current_versions
+
+        # Persist the new checkpoint
+        self.put(config, checkpoint, metadata, new_versions)
+
+        # Drop old checkpoints and writes for this thread, keeping only the new one
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM langgraph_checkpoints WHERE thread_id = ? AND checkpoint_id != ?",
+                (thread_id, new_id),
+            )
+            conn.execute(
+                "DELETE FROM langgraph_writes WHERE thread_id = ?",
+                (thread_id,),
+            )
+
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         return self.get_tuple(config)
 

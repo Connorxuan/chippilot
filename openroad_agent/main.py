@@ -49,7 +49,21 @@ def _load_dotenv() -> None:
 # Load .env before anything else reads os.environ
 _load_dotenv()
 
+from openroad_agent.checkpoint import get_sqlite_checkpointer
 from openroad_agent.config import OpenROADConfig
+from openroad_agent.context_manager import ContextManager
+
+
+def _maybe_compact(thread_id: str, model_name: str, work_dir: str) -> None:
+    """Compact conversation history if it has grown too large."""
+    cm = ContextManager(model_name=model_name)
+    cp = get_sqlite_checkpointer(work_dir)
+    cfg_tuple = cp.get_tuple({"configurable": {"thread_id": thread_id}})
+    if cfg_tuple:
+        hist = cfg_tuple.checkpoint.get("channel_values", {}).get("messages", [])
+        if cm.should_compact(hist):
+            compacted = cm.compact(hist)
+            cp.compact_thread(thread_id, compacted)
 
 
 def create_agent(model: str | None = None, config: OpenROADConfig | None = None):
@@ -272,6 +286,8 @@ async def chat_loop(agent, config: OpenROADConfig) -> None:
 
         print("\n⚙️  Processing...\n")
 
+        _maybe_compact(thread_id, config.model_name, config.work_dir)
+
         try:
             # Stream agent responses
             async for event in agent.astream(
@@ -322,6 +338,8 @@ async def run_single_task(agent, task: str, config: OpenROADConfig) -> str:
 
     thread_id = str(uuid.uuid4())
     run_config = {"configurable": {"thread_id": thread_id}}
+
+    _maybe_compact(thread_id, config.model_name, config.work_dir)
 
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content=task)]},

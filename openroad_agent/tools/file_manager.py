@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -180,33 +181,220 @@ def list_design_files(design_name: str = "") -> str:
     }, indent=2)
 
 
+_FILE_READ_HARD_LIMIT = 500_000
+
+
+def _resolve_file_path(file_path: str) -> str:
+    """Resolve a file path relative to the designs root."""
+    if os.path.isabs(file_path):
+        return file_path
+    root = _designs_root()
+    candidate = os.path.join(root, file_path)
+    if os.path.exists(candidate):
+        return candidate
+    matches = list(Path(root).rglob(Path(file_path).name))
+    if len(matches) == 1:
+        return str(matches[0])
+    return candidate
+
+
+def _safe_read(path: str, limit: int = 200_000) -> str:
+    """Read a text file with a hard size cap.
+
+    Args:
+        path: File path.
+        limit: Max characters to read.
+
+    Returns:
+        File content, truncated if necessary with a trailing note.
+    """
+    cap = min(limit, _FILE_READ_HARD_LIMIT)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(cap + 1)
+    except FileNotFoundError:
+        return f"Error: File not found: {path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    if len(content) > cap:
+        content = content[:cap] + (
+            f"\n\n[File truncated after {cap} characters. "
+            "Use read_file_chunk or search_in_file to read a specific section.]"
+        )
+    return content
+
+
+def _count_lines(path: str) -> int:
+    """Count lines in a text file."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return 0
+
+
+def _large_file_guidance(file_path: str, size: int, max_chars: int) -> str:
+    """Return a guidance message when a file is too large to read at once."""
+    lines = _count_lines(file_path)
+    lines_info = f" (~{lines} lines)" if lines else ""
+    return (
+        f"File '{os.path.basename(file_path)}' is {size:,} characters{lines_info}, "
+        f"larger than the direct-read limit of {max_chars:,} characters.\n\n"
+        "To read this file, use one of these approaches:\n"
+        "1. read_file_chunk(file_path, line_start=1, line_end=500) — read a line range\n"
+        "2. search_in_file(file_path, pattern='keyword', context_lines=10) — search with regex\n"
+        "3. read_openroad_log(file_path, tail_lines=200) — if it's a log, read the tail\n"
+    )
+
+
 @tool
-def read_design_file(file_path: str) -> str:
+def read_design_file(file_path: str, max_chars: int = 200_000) -> str:
     """Read the content of a design file.
+
+    If the file is larger than *max_chars*, a guidance message is returned
+    instead of the raw content.  Use ``read_file_chunk`` or
+    ``search_in_file`` to access large files in smaller pieces.
 
     Args:
         file_path: Absolute path to the file, or relative to work_dir/designs/.
+        max_chars: Maximum characters to return directly.  Files larger than
+                   this trigger the guidance response (hard limit 500k).
 
     Returns:
-        The file content as a string.
+        The file content, or a guidance message telling you how to read it
+        in chunks.
     """
-    if not os.path.isabs(file_path):
-        root = _designs_root()
-        candidate = os.path.join(root, file_path)
-        if os.path.exists(candidate):
-            file_path = candidate
-        else:
-            matches = list(Path(root).rglob(Path(file_path).name))
-            if len(matches) == 1:
-                file_path = str(matches[0])
-            else:
-                file_path = candidate
+    file_path = _resolve_file_path(file_path)
 
     try:
-        with open(file_path, "r") as f:
-            content = f.read()
-        return content
+        size = os.path.getsize(file_path)
     except FileNotFoundError:
         return f"Error: File not found: {file_path}"
     except Exception as e:
         return f"Error reading file: {e}"
+
+    if size > max_chars:
+        return _large_file_guidance(file_path, size, max_chars)
+
+    return _safe_read(file_path, max_chars)
+
+
+@tool
+def read_file_chunk(
+    file_path: str,
+    line_start: int = 1,
+    line_end: int = 500,
+    max_chars: int = 200_000,
+) -> str:
+    """Read a specific line range from a text file.
+
+    Use this for large design files, logs, or reports that cannot be
+    read in one shot with ``read_design_file``.
+
+    Args:
+        file_path: Absolute path, or relative to work_dir/designs/.
+        line_start: First line to read (1-indexed).
+        line_end: Last line to read (inclusive).
+        max_chars: Hard cap on characters returned (default 200k).
+
+    Returns:
+        The requested chunk, with a note if truncated.
+    """
+    file_path = _resolve_file_path(file_path)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return f"Error: File not found: {file_path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    total_lines = len(lines)
+    if line_start < 1:
+        line_start = 1
+    if line_end > total_lines:
+        line_end = total_lines
+
+    chunk = "".join(lines[line_start - 1 : line_end])
+    cap = min(max_chars, _FILE_READ_HARD_LIMIT)
+    if len(chunk) > cap:
+        chunk = chunk[:cap] + (
+            f"\n\n[Chunk truncated after {cap} characters. "
+            "Narrow the line range or use search_in_file.]"
+        )
+
+    header = f"--- Lines {line_start}-{line_end} of {total_lines} ---\n"
+    return header + chunk
+
+
+@tool
+def search_in_file(
+    file_path: str,
+    pattern: str,
+    context_lines: int = 10,
+    max_matches: int = 20,
+) -> str:
+    """Search inside a text file with a regex pattern.
+
+    Returns each matching line together with *context_lines* of context
+    before and after the match.  Ideal for locating keywords in large
+    RTL files, TCL scripts, or log files without reading them whole.
+
+    Args:
+        file_path: Absolute path, or relative to work_dir/designs/.
+        pattern: Regex pattern to search for (Python re syntax).
+        context_lines: Lines to show before/after each match.
+        max_matches: Maximum number of matches to return.
+
+    Returns:
+        Matching sections, or a message if no matches were found.
+    """
+    file_path = _resolve_file_path(file_path)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return f"Error: File not found: {file_path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    total_lines = len(lines)
+    compiled: re.Pattern | None = None
+    try:
+        compiled = re.compile(pattern)
+    except re.error as e:
+        return f"Invalid regex pattern: {e}"
+
+    matches: list[tuple[int, str]] = []
+    for idx, line in enumerate(lines, start=1):
+        if compiled.search(line):
+            matches.append((idx, line.rstrip("\n")))
+        if len(matches) >= max_matches:
+            break
+
+    if not matches:
+        return (
+            f"No matches for pattern '{pattern}' in {os.path.basename(file_path)} "
+            f"({total_lines} lines)."
+        )
+
+    sections: list[str] = []
+    for lineno, matched_line in matches:
+        start = max(1, lineno - context_lines)
+        end = min(total_lines, lineno + context_lines)
+        section_lines = lines[start - 1 : end]
+        # Mark the matched line
+        marked = []
+        for i, sl in enumerate(section_lines, start=start):
+            prefix = ">>> " if i == lineno else "    "
+            marked.append(f"{prefix}{i:4d}: {sl.rstrip(chr(10))}")
+        sections.append("\n".join(marked))
+
+    header = (
+        f"Found {len(matches)} match(es) for '{pattern}' "
+        f"in {os.path.basename(file_path)} ({total_lines} lines):\n"
+    )
+    return header + "\n\n---\n\n".join(sections)
