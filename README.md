@@ -83,7 +83,7 @@ openroad-agent --model google_genai:gemini-2.5-flash
 ### Web 前端
 
 ```bash
-# 启动 ChatGPT 风格的 Web UI
+# 启动 Web UI
 openroad-agent-web
 
 # 默认地址
@@ -91,10 +91,16 @@ http://127.0.0.1:8000
 ```
 
 Web UI 特性：
-- ChatGPT 风格的左侧会话栏 + 主聊天区布局
+- 左侧会话栏 + 主聊天区布局
 - 直接读取 `openroad_work/sessions/` 中已有历史会话
 - 通过 FastAPI 调用现有 Chippilot/OpenROAD agent
 - 支持从前端发起新的 flow、分析和优化对话
+
+### EDA-Agent-Bench Adapter
+
+本地 benchmark 控制面提供结构化任务、隔离 snapshot、预算、事件和产物接口，且与
+`experiment/` runner 相互独立。部署和协议参见
+[`docs/benchmark_adapter.md`](docs/benchmark_adapter.md)。
 
 ### 快速运行
 

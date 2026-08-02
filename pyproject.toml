@@ -30,9 +30,11 @@ dev = [
 [project.scripts]
 openroad-agent = "openroad_agent.main:main"
 openroad-agent-web = "openroad_agent.web_api:main"
+openroad-benchmark-api = "benchmark_adapter.cli:api_main"
+openroad-benchmark-worker = "benchmark_adapter.cli:worker_main"
 
 [tool.setuptools.packages.find]
-include = ["openroad_agent*"]
+include = ["openroad_agent*", "benchmark_adapter*"]
 
 [tool.setuptools.package-data]
 openroad_agent = ["web_static/*"]

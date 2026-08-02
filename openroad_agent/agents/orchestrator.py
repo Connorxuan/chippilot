@@ -14,6 +14,7 @@ from langchain.agents import create_agent
 from openroad_agent.checkpoint import get_sqlite_checkpointer
 from openroad_agent.config import create_llm
 from openroad_agent.config import OpenROADConfig
+from openroad_agent.instrumentation import select_tools
 from openroad_agent.prompts.system_prompts import (
     ORCHESTRATOR_PROMPT,
     TCL_GENERATOR_PROMPT,
@@ -73,7 +74,7 @@ from openroad_agent.tools.session_manager import (
 )
 
 
-def _all_tools():
+def _all_tools(extra_tools: list[Any] | None = None):
     """Return the full list of available tools."""
     return [
         run_openroad_tcl,
@@ -111,6 +112,7 @@ def _all_tools():
         get_session_info,
         list_downloadable_artifacts,
         list_sessions,
+        *(extra_tools or []),
     ]
 
 
@@ -379,6 +381,10 @@ def _make_subagent_tool(
 def create_orchestrator_agent(
     model: str | None = None,
     config: OpenROADConfig | None = None,
+    *,
+    tool_catalog: set[str] | None = None,
+    execution_observer: Any | None = None,
+    extra_tools: list[Any] | None = None,
 ) -> Any:
     """Create the master orchestrator agent with all tools and sub-agents.
 
@@ -397,7 +403,12 @@ def create_orchestrator_agent(
     if not SessionManager.get_current():
         SessionManager.start_new(cfg.work_dir)
 
-    tools = _all_tools()
+    raw_tools = _all_tools(extra_tools)
+    tools = select_tools(raw_tools, tool_catalog, execution_observer)
+    by_name = {item.name: item for item in tools}
+
+    def available(*items: Any) -> list[Any]:
+        return [by_name[item.name] for item in items if item.name in by_name]
 
     # Build sub-agent delegation tools
     subagent_tools = [
@@ -409,7 +420,7 @@ def create_orchestrator_agent(
                 "here when you need a new or modified TCL / synthesis script."
             ),
             system_prompt=TCL_GENERATOR_PROMPT,
-            agent_tools=[
+            agent_tools=available(
                 assemble_full_flow_tcl,
                 assemble_partial_flow_tcl,
                 get_tcl_template,
@@ -422,7 +433,7 @@ def create_orchestrator_agent(
                 search_in_file,
                 generate_yosys_synth_script,
                 list_synth_platforms,
-            ],
+            ),
             model_name=model_name,
         ),
         _make_subagent_tool(
@@ -432,7 +443,7 @@ def create_orchestrator_agent(
                 "Delegate here to interpret run outputs and identify issues."
             ),
             system_prompt=ANALYSER_PROMPT,
-            agent_tools=[
+            agent_tools=available(
                 parse_metrics_file,
                 compare_metrics,
                 extract_timing_summary,
@@ -440,7 +451,7 @@ def create_orchestrator_agent(
                 analyse_timing_report,
                 suggest_parameter_ranges,
                 read_openroad_log,
-            ],
+            ),
             model_name=model_name,
         ),
         _make_subagent_tool(
@@ -466,7 +477,7 @@ def create_orchestrator_agent(
     ]
 
     llm = create_llm(model_name)
-    all_agent_tools = tools + subagent_tools
+    all_agent_tools = tools + select_tools(subagent_tools, None, execution_observer)
 
     return create_agent(
         model=llm,

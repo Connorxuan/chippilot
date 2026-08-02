@@ -1,9 +1,11 @@
 /experiment/
 /OpenROAD/
 /openroad_work/
+/openroad_benchmark_work/
 /paper/
 /paper_rewriting_output/
 *.log
+CLAUDE.md
 
 # Python-generated files
 __pycache__/

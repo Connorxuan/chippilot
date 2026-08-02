@@ -19,9 +19,24 @@ import base64
 import shutil
 import tempfile
 import time
+from contextvars import ContextVar
 from typing import Any
 
 from ray.job_submission import JobStatus, JobSubmissionClient
+
+
+_ray_job_callback: ContextVar[Any | None] = ContextVar("ray_job_callback", default=None)
+
+
+def set_ray_job_callback(callback) -> None:
+    """Set an optional per-context callback for submitted/terminal Ray jobs."""
+    _ray_job_callback.set(callback)
+
+
+def _notify_ray_job(event_type: str, job_id: str, address: str) -> None:
+    callback = _ray_job_callback.get()
+    if callback:
+        callback(event_type, job_id, address)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +99,7 @@ def _run_job_payload(
     """Submit a self-contained Ray job and return its marker JSON."""
     client = _job_client(ray_address)
     temp_dir = tempfile.mkdtemp(prefix="chippilot_ray_job_")
+    job_id = ""
     try:
         runner_path = os.path.join(temp_dir, "runner.py")
         payload_path = os.path.join(temp_dir, "payload.json")
@@ -96,6 +112,7 @@ def _run_job_payload(
             entrypoint="python runner.py payload.json",
             runtime_env={"working_dir": temp_dir},
         )
+        _notify_ray_job("submitted", job_id, ray_address)
         deadline = time.time() + timeout_seconds
         while True:
             status = client.get_job_status(job_id)
@@ -140,7 +157,21 @@ def _run_job_payload(
         if _status_name(status) != "SUCCEEDED" and result.get("success") is not True:
             result["stderr"] = result.get("stderr") or f"Ray job ended with status {status}."
         return result
+    except BaseException:
+        if job_id:
+            try:
+                client.stop_job(job_id)
+                _notify_ray_job("stopped", job_id, ray_address)
+            except Exception:
+                _notify_ray_job("orphaned", job_id, ray_address)
+        raise
     finally:
+        if job_id:
+            try:
+                if _terminal_status(client.get_job_status(job_id)):
+                    _notify_ray_job("finished", job_id, ray_address)
+            except Exception:
+                pass
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

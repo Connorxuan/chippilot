@@ -66,7 +66,14 @@ def _maybe_compact(thread_id: str, model_name: str, work_dir: str) -> None:
             cp.compact_thread(thread_id, compacted)
 
 
-def create_agent(model: str | None = None, config: OpenROADConfig | None = None):
+def create_agent(
+    model: str | None = None,
+    config: OpenROADConfig | None = None,
+    *,
+    tool_catalog: set[str] | None = None,
+    execution_observer=None,
+    extra_tools=None,
+):
     """Create and return the orchestrator agent.
 
     Args:
@@ -77,7 +84,13 @@ def create_agent(model: str | None = None, config: OpenROADConfig | None = None)
         A compiled DeepAgent graph.
     """
     from openroad_agent.agents.orchestrator import create_orchestrator_agent
-    return create_orchestrator_agent(model=model, config=config)
+    return create_orchestrator_agent(
+        model=model,
+        config=config,
+        tool_catalog=tool_catalog,
+        execution_observer=execution_observer,
+        extra_tools=extra_tools,
+    )
 
 
 # ── Streaming display helpers ──────────────────────────────────────────
