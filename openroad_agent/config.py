@@ -33,6 +33,26 @@ SUPPORTED_MODELS = [
 ]
 
 
+def create_llm(model_name: str | None = None, **kwargs) -> Any:
+    """Create an LLM instance with provider-specific configuration.
+
+    For DeepSeek models, disables automatic thinking mode to avoid
+    multi-turn reasoning_content preservation issues.
+    """
+    from langchain.chat_models.base import init_chat_model
+
+    name = model_name or os.environ.get("OPENROAD_LLM_MODEL", "deepseek:deepseek-v4-pro")
+    name = _normalize_model_name(name)
+
+    if name.startswith("deepseek:"):
+        if "model_kwargs" not in kwargs:
+            kwargs["model_kwargs"] = {}
+        kwargs["model_kwargs"].setdefault("extra_body", {})
+        kwargs["model_kwargs"]["extra_body"].setdefault("thinking", {"type": "disabled"})
+
+    return init_chat_model(name, **kwargs)
+
+
 def _normalize_model_name(name: str) -> str:
     """Ensure a model name has the correct LangChain provider prefix.
 
@@ -84,7 +104,7 @@ class OpenROADConfig:
     # "ray"   = submit to remote Ray cluster
     execution_mode: str = os.environ.get("OPENROAD_EXEC_MODE", "ray")
     ray_address: str = os.environ.get(
-        "RAY_ADDRESS", "ray://10.0.4.85:10001"
+        "RAY_ADDRESS", "ray://10.0.13.181:10001"
     )
 
     # ── Exploration defaults ───────────────────────────────────────────

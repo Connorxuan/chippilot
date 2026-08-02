@@ -10,7 +10,8 @@ import os
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain.chat_models.base import init_chat_model
+
+from openroad_agent.config import create_llm
 
 
 def _msg_content(msg: Any) -> str:
@@ -74,7 +75,7 @@ def summarize_messages(
     Returns:
         A concise paragraph covering goals, actions, results, and status.
     """
-    llm = init_chat_model(
+    llm = create_llm(
         model_name or os.environ.get("OPENROAD_LLM_MODEL", "google_genai:gemini-2.5-flash")
     )
 

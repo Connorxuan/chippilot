@@ -2,6 +2,24 @@
 /OpenROAD/
 /openroad_work/
 /paper/
-/openroad_agent.egg-info/
-/__pycache__/
+/paper_rewriting_output/
 *.log
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Local configuration and runtime data
+.env
+var/
+
+# Test and type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

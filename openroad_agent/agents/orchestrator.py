@@ -7,12 +7,12 @@ import contextvars
 import threading
 from typing import Any
 
-from langchain.chat_models.base import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain.agents import create_agent
 
 from openroad_agent.checkpoint import get_sqlite_checkpointer
+from openroad_agent.config import create_llm
 from openroad_agent.config import OpenROADConfig
 from openroad_agent.prompts.system_prompts import (
     ORCHESTRATOR_PROMPT,
@@ -312,7 +312,7 @@ def _make_subagent_tool(
             cb("start", name, None)
 
         try:
-            llm = init_chat_model(model_name)
+            llm = create_llm(model_name)
             sub = create_agent(
                 model=llm,
                 tools=agent_tools,
@@ -465,7 +465,7 @@ def create_orchestrator_agent(
         ),
     ]
 
-    llm = init_chat_model(model_name)
+    llm = create_llm(model_name)
     all_agent_tools = tools + subagent_tools
 
     return create_agent(
